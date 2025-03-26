@@ -253,12 +253,27 @@ class DiffusionPolicy(ParametricPolicy):
             self._high = self._high.to(state.device)
             self._chol_sigma = self._chol_sigma.to(state.device)
         with torch.no_grad():
-            if self._normalize_states:
-                if self._states_mean is None:
-                    raise ValueError('States mean is not set by the agent class')
-                state_query = (state - self._states_mean) / self._states_std
+            ## Debug for distribution shift...
+            if self.debug_replay_states is not None:
+            # self._high = self._high.to(state.device)
+            # self._low = self._low.to(state.device)
+                # Use state from replay buffer to induce the same observation distribution
+                # to test the actions from the network
+                state_query = torch.tensor(self.debug_replay_states[self.debug_replay_index])
+                if self.debug_replay_actions is None:
+                    self.debug_replay_index += 1
+                if self._normalize_states:
+                    if self._states_mean is None:
+                        raise ValueError('States mean is not set by the agent class')
+                    state_query = (state_query - self._states_mean) / self._states_std
+            ## Debug end
             else:
-                state_query = state
+                if self._normalize_states:
+                    if self._states_mean is None:
+                        raise ValueError('States mean is not set by the agent class')
+                    state_query = (state - self._states_mean) / self._states_std
+                else:
+                    state_query = state
             
             input_batch = { # batch_size = 1
                 'observation.state': state_query.unsqueeze(0).to(TorchUtils.get_device())
@@ -284,6 +299,19 @@ class DiffusionPolicy(ParametricPolicy):
             #     # print("action: ", torch.round(action*100)/100)
             # else:
             action = action_raw
+
+            ## Debug for distribution shift...
+            if self.debug_replay_actions is not None:
+                next_replay_action = torch.tensor(self.debug_replay_actions[self.debug_replay_index])
+                self.debug_replay_index += 1
+
+                # Check if the network action is the same as the replay action
+                action_diff = torch.mean(torch.abs(action - next_replay_action))
+                self.debug_action_diffs.append(action_diff)
+
+                # Optional: Take the replay action instead of the network action to induce the same observation distribution
+                action = next_replay_action
+            ## Debug end
 
             action_clipped = torch.clip(action, self._low, self._high)
             

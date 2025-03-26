@@ -162,7 +162,7 @@ class BC_DP(DeepAC):
             obs_stack = episode['obs'][obs_indices]
             rearranged_dataset['obs'] = torch.cat((rearranged_dataset['obs'], obs_stack), dim=0)
             # stack actions
-            act_indices = torch.arange(len(episode['action'])).unsqueeze(1) - torch.arange(n_obs_steps-1, -action_horizon+1, -1)
+            act_indices = torch.arange(len(episode['action'])).unsqueeze(1) - torch.arange(n_obs_steps-1, n_obs_steps-1-action_horizon, -1)
             # correct for indices out of range. Just pad with the first/last element
             act_indices = torch.clip(act_indices, 0, len(episode['action'])-1)
             act_stack = episode['action'][act_indices]

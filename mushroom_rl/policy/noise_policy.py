@@ -218,7 +218,8 @@ class ClippedGaussianPolicy(ParametricPolicy):
                 # Use state from replay buffer to induce the same observation distribution
                 # to test the actions from the network
                 state_query = torch.tensor(self.debug_replay_states[self.debug_replay_index])
-                self.debug_replay_index += 1
+                if self.debug_replay_actions is None:
+                    self.debug_replay_index += 1
                 if self._normalize_states:
                     if self._states_mean is None:
                         raise ValueError('States mean is not set by the agent class')
@@ -260,10 +261,10 @@ class ClippedGaussianPolicy(ParametricPolicy):
                 self.debug_replay_index += 1
 
                 # Check if the network action is the same as the replay action
-                action_diff = torch.mean(torch.abs(action - next_replay_action))
+                action_diff = torch.abs(action - next_replay_action)
                 self.debug_action_diffs.append(action_diff)
 
-                # Take the replay action instead of the network action to induce the same observation distribution
+                # Optional: Take the replay action instead of the network action to induce the same observation distribution
                 action = next_replay_action
             ## Debug end
 

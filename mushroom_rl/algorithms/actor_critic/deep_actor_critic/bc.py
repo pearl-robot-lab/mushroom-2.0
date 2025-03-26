@@ -96,7 +96,7 @@ class BC(DeepAC):
             _fit_count='primitive',
         )
     
-    def load_dataset(self, dataset):
+    def load_dataset(self, dataset, debug=False):
         self.dataset = dataset
         if self._normalize_states:
             self._compute_states_mean_std(self.dataset['obs'])
