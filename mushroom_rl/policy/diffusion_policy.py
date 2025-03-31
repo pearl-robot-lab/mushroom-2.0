@@ -59,10 +59,22 @@ class DiffusionPolicy(ParametricPolicy):
 
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
+
         
         self._n_obs_steps = policy_params['n_obs_steps']
         self._horizon = policy_params['horizon']
         self._n_action_steps = policy_params['n_action_steps']
+        self._temp_ensemble = policy_params['temp_ensemble']
+        if self._temp_ensemble is True:
+            # full_episode_actions dict for temporal ensembling
+            self._full_episode_actions = {}
+            self._episode_step = 0
+            assert (self._horizon-(self._n_obs_steps-1)) % self._n_action_steps == 0 , \
+                  "Config error: For temporal ensembling, the horizon minus the number of observation steps must be divisible by the number of action steps"
+            self._num_ensembles = int( (self._horizon-(self._n_obs_steps-1)) / self._n_action_steps )
+            ensem_weights = torch.exp(- 0.5 * torch.arange(self._num_ensembles, device=TorchUtils.get_device()) )
+            self._ensem_weights = ensem_weights / torch.sum(ensem_weights)
+
         self._image_features = policy_params['image_features']
         self._env_state_feature = policy_params['env_state_feature']
         model_config = policy_params # just use the same
@@ -98,6 +110,7 @@ class DiffusionPolicy(ParametricPolicy):
             _n_obs_steps='primitive',
             _horizon='primitive',
             _n_action_steps='primitive',
+            _temp_ensemble='primitive',
             _image_features='primitive',
             _env_state_feature='primitive',
             _low='torch',
@@ -134,6 +147,10 @@ class DiffusionPolicy(ParametricPolicy):
         if self._env_state_feature:
             raise NotImplementedError("Environment state feature is not implemented yet")
             self._queues["observation.environment_state"] = deque(maxlen=self._n_obs_steps)
+        if self._temp_ensemble is True:
+            # clear full_episode_actions dict for the next episode
+            self._full_episode_actions = {}
+            self._episode_step = 0
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -176,7 +193,33 @@ class DiffusionPolicy(ParametricPolicy):
             # actions = self.unnormalize_outputs({"action": actions})["action"]
             # TODO: check if action normalization/unnormalization is needed
 
-            self._queues["action"].extend(actions.transpose(0, 1))
+            # Extract `n_action_steps` steps worth of actions (from the current observation).
+            start = self._n_obs_steps - 1
+            end = start + self._n_action_steps
+            actions_queued = actions[:, start:end].clone()
+
+            if self._temp_ensemble is True:
+                # Add current actions to the full_episode_actions dict
+                curr_step = self._episode_step
+                for act in actions[0, start:]:
+                    if curr_step in self._full_episode_actions:
+                        self._full_episode_actions[curr_step] = torch.vstack((act.unsqueeze(0), self._full_episode_actions[curr_step])) # NOTE: Make sure you put new actions on top
+                    else:
+                        self._full_episode_actions[curr_step] = act.unsqueeze(0)
+                    curr_step += 1
+                
+                # get weighted ensembled actions for n_action_steps
+                for step in range(self._episode_step, self._episode_step+self._n_action_steps):
+                    if len(self._full_episode_actions[step]) < self._num_ensembles:
+                        # don't emsemble if not enough actions are available
+                        break
+                    else:
+                        actions_queued[0, step-self._episode_step] = torch.sum(self._full_episode_actions[step] * self._ensem_weights.unsqueeze(1), dim=0)
+
+                # set self._episode_step to the next expected step in this call
+                self._episode_step += self._n_action_steps
+
+            self._queues["action"].extend(actions_queued.transpose(0, 1))
 
         action = self._queues["action"].popleft()
         return action
