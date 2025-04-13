@@ -27,7 +27,7 @@ class DAgger(DeepAC):
                  actor_params, actor_optimizer, critic_params=None,
                  batch_size=1, n_epochs_policy=1, patience=1, squash_actions=False,
                  discrete_action_dims=0, continuous_action_dims=0,
-                 initial_replay_size=600, max_replay_size=10000,
+                 initial_replay_size=600, max_replay_size=10000, additional_replay=False,
                  normalize_states=False, normalize_actions=False,
                  critic_fit_params=None, actor_predict_params=None, critic_predict_params=None):
         """
@@ -50,6 +50,8 @@ class DAgger(DeepAC):
             continuous_action_dims (int, 0): number of continuous actions in the action space;
             initial_replay_size (int, 600): the minimum number of samples before starting the learning with replay memory;
             max_replay_size (int, 10000): the maximum number of samples in the replay memory;
+            additional_replay (bool, False): whether to use an additional replay memory for
+            any additional expert action types (Eg. whole-body control actions);
             normalize_states (bool, False): whether to normalize states;
             normalize_actions (bool, False): whether to normalize actions;
             critic_fit_params (dict, None): Unused parameter; Left for future
@@ -83,6 +85,11 @@ class DAgger(DeepAC):
 
         # create an expert action replay memory buffer
         self._expert_replay_memory = ReplayMemory(mdp_info, self.info, initial_replay_size, max_replay_size)
+        # (Optional) create another expert action replay memory buffer with a different actions (Eg. whole-body control actions)
+        if additional_replay is True:
+            self._additional_expert_replay_memory = ReplayMemory(mdp_info, self.info, initial_replay_size, max_replay_size)
+        else:
+            self._additional_expert_replay_memory = None
 
         self._fit_count = 0
         self._actor_last_loss = 0 # Store actor loss for logging
@@ -103,6 +110,7 @@ class DAgger(DeepAC):
             _actor_predict_params='pickle',
             _actor_approximator='mushroom',
             _expert_replay_memory='mushroom',
+            _additional_expert_replay_memory='mushroom',
             _fit_count='primitive',
             _actor_last_loss='primitive',
         )
@@ -133,7 +141,8 @@ class DAgger(DeepAC):
         # if self._normalize_actions:
         #     self._compute_actions_mean_std(self.pre_train_dataset['action'])
     
-    def fit(self, n_epochs=None, pretrain_data=False, pre_train_maintain=False, pre_train_maintain_percent=0.0, track_loss=True):
+    def fit(self, n_epochs=None, pretrain_data=False, pre_train_maintain=False, pre_train_maintain_percent=0.0,
+            use_high_level_actions=False, track_loss=True):
         # fit on the expert replay memory data for n_epochs
         if n_epochs is None:
             n_epochs = self._n_epochs_policy()
@@ -163,7 +172,12 @@ class DAgger(DeepAC):
         for epoch_count in range(n_epochs):
             if expert_replay_batch_size > 0:
                 # get batch from the expert replay memory
-                obs, act, _, _, _, _ = self._expert_replay_memory.get(expert_replay_batch_size)
+                if use_high_level_actions is True:
+                    # get batch from the additional high-level action expert replay memory
+                    obs, act, _, _, _, _ = self._additional_expert_replay_memory.get(expert_replay_batch_size)
+                else:
+                    # get batch from the regular expert replay memory
+                    obs, act, _, _, _, _ = self._expert_replay_memory.get(expert_replay_batch_size)
             else:
                 obs = np.zeros((0, self.mdp_info.observation_space.shape[0]))
                 act = np.zeros((0, self.mdp_info.action_space.shape[0]))
