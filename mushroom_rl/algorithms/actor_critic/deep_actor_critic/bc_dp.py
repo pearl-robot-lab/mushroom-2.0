@@ -19,13 +19,6 @@ class BC_DP(DeepAC):
     here to compare against other methods such as TD3+BC.
     Normally uses DiffusionPolicy (https://diffusion-policy.cs.columbia.edu/)
 
-                    agent = algo(env.info, policy_class, policy_params,
-                             actor_params, actor_optimizer, critic_params=None,
-                             batch_size=rl_params_cfg.batch_size, n_epochs_policy=rl_params_cfg.n_epochs_policy,
-                             squash_actions=rl_params_cfg.squash_actions, discrete_action_dims=discrete_action_dims,
-                             continuous_action_dims=continuous_action_dims,
-                             normalize_states=rl_params_cfg.normalize_states, normalize_actions=rl_params_cfg.normalize_actions)
-
     """
     def __init__(self, mdp_info, policy_class, policy_params,
                  actor_params, actor_optimizer, critic_params=None,
@@ -70,6 +63,7 @@ class BC_DP(DeepAC):
 
         super().__init__(mdp_info, policy, actor_optimizer, policy_parameters)
 
+
         self._batch_size = to_parameter(batch_size)
         self._n_epochs_policy = to_parameter(n_epochs_policy)
         # self._patience = to_parameter(patience)
@@ -86,6 +80,13 @@ class BC_DP(DeepAC):
         self._fit_count = 0
         self._actor_last_loss = None # Store actor loss for logging
 
+        # Optimizer deviations from mushroom_rl
+        if policy_params['use_transformer'] is True:
+            # create the transformer optimizers here and assign to self
+            self._optimizer = policy._model.net.configure_optimizers(learning_rate=policy_params['transformer_lr_actor_net'],
+                                                                weight_decay=policy_params['transformer_weight_decay_actor_net'],
+                                                                betas=policy_params['transformer_betas_actor_net'])
+            self._parameters = policy._model.parameters()
         # remove optimizer save attribute from super class since we will use our own method to save model and optimizer instead
         del self._save_attributes['_optimizer']
 

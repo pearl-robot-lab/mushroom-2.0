@@ -59,7 +59,6 @@ class DiffusionPolicy(ParametricPolicy):
 
         # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
-
         
         self._n_obs_steps = policy_params['n_obs_steps']
         self._horizon = policy_params['horizon']
