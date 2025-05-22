@@ -1,15 +1,15 @@
-import numpy as np
 import torch
+import numpy as np
 # from mushroom_rl.algorithms.actor_critic.deep_actor_critic import TD3
 from mushroom_rl.algorithms.actor_critic.deep_actor_critic import DeepAC
 from mushroom_rl.policy import Policy
 from mushroom_rl.approximators import Regressor
 from mushroom_rl.approximators.parametric import TorchApproximator
 from mushroom_rl.rl_utils.replay_memory import ReplayMemory
-from mushroom_rl.rl_utils.parameters import to_parameter
 
 from mushroom_rl.core.dataset import Dataset
 from mushroom_rl.utils.minibatches import minibatch_generator
+from mushroom_rl.rl_utils.parameters import Parameter, to_parameter
 from mushroom_rl.utils.torch import TorchUtils
 from tqdm import trange
 from copy import deepcopy
@@ -22,10 +22,10 @@ class TD3_BC(DeepAC):
     Fujimoto S. et al.. 2021.
 
     """
-    def __init__(self, mdp_info, policy_class, policy_params, actor_params,
-                 actor_optimizer, critic_params, batch_size,
-                 initial_replay_size, max_replay_size, tau, policy_delay=2,
-                 noise_std=.2, noise_clip=.5, squash_actions=False,
+    def __init__(self, mdp_info, policy_class, policy_params,
+                 actor_params, actor_optimizer, critic_params,
+                 batch_size, initial_replay_size, max_replay_size, tau, policy_delay=2,
+                 noise_std=.2, noise_clip=.5, squash_actions=False, normalize_states=False,
                  offline_alpha=0.25, online_alpha=0.0,
                  critic_fit_params=None, actor_predict_params=None, critic_predict_params=None):
         """
@@ -53,6 +53,7 @@ class TD3_BC(DeepAC):
             noise_clip ([float, Parameter], .5): maximum absolute value for policy smoothing
                 noise;
             squash_actions (bool, False): whether to squash the actions to [-1, 1] with tanh;
+            normalize_states (bool, False): whether to normalize states;
             offline_alpha ([float, Parameter], 0.25): weight of the BC loss when fitting on the offline dataset;
             online_alpha ([float, Parameter], 0.25): weight of the offline BC loss during online training;
             critic_fit_params (dict, None): parameters of the fitting algorithm
@@ -101,6 +102,10 @@ class TD3_BC(DeepAC):
         self._noise_std = to_parameter(noise_std)
         self._noise_clip = to_parameter(noise_clip)
         self._squash_actions = squash_actions
+        self._normalize_states = normalize_states
+        self._states_mean = None
+        self._states_std = None
+
 
 
         self._offline_alpha = to_parameter(offline_alpha)
@@ -123,11 +128,14 @@ class TD3_BC(DeepAC):
             _noise_std='mushroom',
             _noise_clip='mushroom',
             _squash_actions='primitive',
+            _normalize_states='primitive',
+            _states_mean='primitive',
+            _states_std='primitive',
             _offline_alpha='mushroom',
             _online_alpha='mushroom'
         )
     
-    def load_dataset(self, datasets):
+    def load_dataset(self, datasets, debug=False):
         # there can be more than one dataset so loop over the list
         for dataset in datasets:
             # load & create mushroom dataset
@@ -139,11 +147,14 @@ class TD3_BC(DeepAC):
             else:
                 self.offline_dataset += mushroom_dataset
         
+        if self._normalize_states:
+            self._compute_states_mean_std(self.offline_dataset.state)
+        
         # copy it over to the replay buffer
         self._replay_memory._initial_size = len(self.offline_dataset) # set initial size to the size of the offline dataset
         if self._replay_memory._max_size < len(self.offline_dataset):
             print('[[Warning: Offline dataset size exceeds max replay memory size. Resizing replay memory to fit dataset.]]')
-            self._replay_memory._max_size = len(self.offline_dataset)
+            self._replay_memory = ReplayMemory(self.mdp_info, self.info, len(self.offline_dataset), len(self.offline_dataset))
         self._replay_memory.add(self.offline_dataset)
 
     def _next_q(self, next_state, absorbing):
@@ -183,7 +194,13 @@ class TD3_BC(DeepAC):
         
         # fit on the dataset (for n_epochs)
         for epoch in trange(n_epochs):
-            state, action, reward, next_state, absorbing, _ = self._replay_memory.get(self._batch_size())
+            obs, action, reward, next_obs, absorbing, _ = self._replay_memory.get(self._batch_size())
+            if self._normalize_states:
+                state = self._norm_states(obs)
+                next_state = self._norm_states(next_obs)
+            else:
+                state = obs
+                next_state = next_obs
 
             q_next = self._next_q(next_state, absorbing)
             q = reward + self.mdp_info.gamma * q_next
@@ -271,6 +288,19 @@ class TD3_BC(DeepAC):
 
         return self._bc_loss_fn(act_pred, act) # normally mse loss
     
+    def _compute_states_mean_std(self, states: np.ndarray, eps: float = 1e-3):
+        self._states_mean = states.mean(0)
+        self._states_std = states.std(0) + eps
+
+        # set them for the policy as well so that we use it when drawing actions
+        self.policy._states_mean = self._states_mean
+        self.policy._states_std = self._states_std
+
+    def _norm_states(self, states: np.ndarray):
+        if self._states_mean is None or self._states_std is None:
+            raise ValueError('States mean and std not computed yet. Call _compute_states_mean_std() on the dataset first.')
+        return (states - self._states_mean) / self._states_std
+        
     def _post_load(self):
         self._actor_approximator = self.policy._approximator
         self._update_optimizer_parameters(self._actor_approximator.model.network.parameters())
