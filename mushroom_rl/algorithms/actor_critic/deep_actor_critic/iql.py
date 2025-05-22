@@ -1,14 +1,14 @@
-import numpy as np
 import torch
+import numpy as np
 from mushroom_rl.algorithms.actor_critic.deep_actor_critic import DeepAC
 from mushroom_rl.policy import Policy
 from mushroom_rl.approximators import Regressor
 from mushroom_rl.approximators.parametric import TorchApproximator
 from mushroom_rl.rl_utils.replay_memory import ReplayMemory
-from mushroom_rl.rl_utils.parameters import to_parameter
 
 from mushroom_rl.core.dataset import Dataset
 from mushroom_rl.utils.minibatches import minibatch_generator
+from mushroom_rl.rl_utils.parameters import Parameter, to_parameter
 from mushroom_rl.utils.torch import TorchUtils
 from tqdm import trange
 from copy import deepcopy
@@ -24,8 +24,8 @@ class IQL(DeepAC):
     Modified to also supports hybrid policies (both discrete and continuous actions).
 
     """
-    def __init__(self, mdp_info, policy_class, policy_params, actor_params,
-                 actor_optimizer, critic_params, value_func_params, value_func_optimizer, 
+    def __init__(self, mdp_info, policy_class, policy_params,
+                 actor_params, actor_optimizer, critic_params, value_func_params, value_func_optimizer,
                  batch_size, initial_replay_size, max_replay_size, tau,
                  squash_actions=False, discrete_action_dims=0, continuous_action_dims=0,
                  normalize_states=False, schedule_actor_lr=False,
@@ -149,7 +149,7 @@ class IQL(DeepAC):
             _iql_tau='mushroom',
         )
     
-    def load_dataset(self, datasets):
+    def load_dataset(self, datasets, debug=False):
         # there can be more than one dataset so loop over the list
         for dataset in datasets:
             # load & create mushroom dataset
@@ -160,16 +160,16 @@ class IQL(DeepAC):
                 self.offline_dataset = mushroom_dataset
             else:
                 self.offline_dataset += mushroom_dataset
-            
+        
+        if self._normalize_states:
+            self._compute_states_mean_std(self.offline_dataset.state)
+        
         # copy it over to the replay buffer
         self._replay_memory._initial_size = len(self.offline_dataset) # set initial size to the size of the offline dataset
         if self._replay_memory._max_size < len(self.offline_dataset):
             print('[[Warning: Offline dataset size exceeds max replay memory size. Resizing replay memory to fit dataset.]]')
-            self._replay_memory = ReplayMemory(self.mdp_info, self.info, initial_size=len(self.offline_dataset), max_size=len(self.offline_dataset))
+            self._replay_memory = ReplayMemory(self.mdp_info, self.info, len(self.offline_dataset), len(self.offline_dataset))
         self._replay_memory.add(self.offline_dataset)
-
-        if self._normalize_states:
-            self._compute_states_mean_std(self.offline_dataset.state)
     
     def offline_fit(self, n_epochs):
         if self.offline_dataset is None:
@@ -192,8 +192,14 @@ class IQL(DeepAC):
         self._replay_memory.add(dataset)
         if self._replay_memory.initialized:
             state, action, reward, next_state, absorbing, _ = self._replay_memory.get(self._batch_size())
-
-            self.iql_fit(state, action, reward, next_state, absorbing)
+            if self._normalize_states:
+                state_fit = self._norm_states(state)
+                next_state_fit = self._norm_states(next_state)
+            else:
+                state_fit = state
+                next_state_fit = next_state
+            
+            self.iql_fit(state_fit, action, reward, next_state_fit, absorbing)
 
     def iql_fit(self, state, action, reward, next_state, absorbing):
         with torch.no_grad():
@@ -288,7 +294,7 @@ class IQL(DeepAC):
         if self._states_mean is None or self._states_std is None:
             raise ValueError('States mean and std not computed yet. Call _compute_states_mean_std() on the dataset first.')
         return (states - self._states_mean) / self._states_std
-
+        
     def _post_load(self):
         self._actor_approximator = self.policy._approximator
         self._update_optimizer_parameters(self._actor_approximator.model.network.parameters())

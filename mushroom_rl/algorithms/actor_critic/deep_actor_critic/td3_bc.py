@@ -224,11 +224,18 @@ class TD3_BC(DeepAC):
         bc_loss = self._bc_loss(state, action, action_pred)
 
         return td3_actor_loss + self._offline_alpha() * bc_loss
+        # return bc_loss
 
     def fit(self, dataset): # Online
         self._replay_memory.add(dataset)
         if self._replay_memory.initialized:
-            state, action, reward, next_state, absorbing, _ = self._replay_memory.get(self._batch_size())
+            obs, action, reward, next_obs, absorbing, _ = self._replay_memory.get(self._batch_size())
+            if self._normalize_states:
+                state = self._norm_states(obs)
+                next_state = self._norm_states(next_obs)
+            else:
+                state = obs
+                next_state = next_obs
 
             q_next = self._next_q(next_state, absorbing)
             q = reward + self.mdp_info.gamma * q_next
