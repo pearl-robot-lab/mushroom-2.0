@@ -203,7 +203,7 @@ class BC_DP(DeepAC):
                     # loss = self._loss(state_fit, act_fit)
                     
                     batch = {'observation.state': obs, 'action': act}
-                    loss = self.policy.forward(batch, self._squash_actions)['loss']
+                    loss = self.policy.forward(batch, self._squash_actions)['loss'].mean()
                     self._optimize_actor_parameters(loss)
 
                     self._fit_count += 1

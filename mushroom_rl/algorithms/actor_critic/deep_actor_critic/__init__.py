@@ -11,3 +11,4 @@ from .bc_dp import BC_DP
 from .dagger import DAgger
 from .td3_bc import TD3_BC
 from .iql import IQL
+from .iql_dp import IQL_DP

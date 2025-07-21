@@ -15,13 +15,13 @@ from copy import deepcopy
 
 # from torch.nn.functional import binary_cross_entropy_with_logits
 
-class IQL(DeepAC):
+class IQL_DP(DeepAC):
     """
     IQL Offline-to-Online RL algorithm.
     "Offline Reinforcement Learning with Implicit Q-Learning".
     Kostrikov I. et al.. 2022.
     Reference implementation: https://github.com/corl-team/CORL.
-    Modified to also supports hybrid policies (both discrete and continuous actions).
+    Uses DiffusionPolicy (https://diffusion-policy.cs.columbia.edu/) as policy class.
 
     """
     def __init__(self, mdp_info, policy_class, policy_params,
@@ -30,6 +30,7 @@ class IQL(DeepAC):
                  squash_actions=False, discrete_action_dims=0, continuous_action_dims=0,
                  normalize_states=False, schedule_actor_lr=False, actor_loss_type='ddpg_plus_bc',
                  bc_weight_in_ddpg=0.25, iql_beta=1.0, iql_tau=0.7, max_clamp_adv=100.0,
+                 use_chunking=True,
                  critic_fit_params=None, actor_predict_params=None, critic_predict_params=None):
         """
         Constructor.
@@ -62,6 +63,7 @@ class IQL(DeepAC):
             iql_beta ([float, Parameter], 0.25): For AWR: Inverse temperature. Small beta -> BC, big beta -> maximizing Q; when fitting on the offline dataset;
             iql_tau ([float, Parameter], 0.7): Coefficient for the asymmetric IQL loss;
             max_clamp_adv ([float, Parameter], 100.0): Maximum value considered for the advantage;
+            use_chunking (bool, True): whether to use state and action chunking for the offline dataset;
             critic_fit_params (dict, None): parameters of the fitting algorithm
                 of the critic approximator;
             actor_predict_params (dict, None): parameters for the prediction with the
@@ -71,7 +73,7 @@ class IQL(DeepAC):
 
         """
         self._critic_fit_params = dict() if critic_fit_params is None else critic_fit_params
-        self._actor_predict_params = dict() if actor_predict_params is None else actor_predict_params
+        # self._actor_predict_params = dict() if actor_predict_params is None else actor_predict_params
         self._critic_predict_params = dict() if critic_predict_params is None else critic_predict_params
 
         if 'n_models' in critic_params.keys():
@@ -89,13 +91,15 @@ class IQL(DeepAC):
         value_func_network_params = self._value_func_approximator.model.network.parameters()
         self._value_func_optimizer = value_func_optimizer['class'](value_func_network_params, **value_func_optimizer['params'])
 
-        self._actor_approximator = Regressor(TorchApproximator, **actor_params)
+        # self._actor_approximator = Regressor(TorchApproximator, **actor_params)
 
         self._init_target(self._critic_approximator, self._target_critic_approximator)
 
-        policy = policy_class(self._actor_approximator, **policy_params)
+        # policy = policy_class(self._actor_approximator, **policy_params)
+        policy = policy_class(policy_params)
 
-        policy_parameters = self._actor_approximator.model.network.parameters()
+        # policy_parameters = self._actor_approximator.model.network.parameters()
+        policy_parameters = policy._model.parameters()
 
         super().__init__(mdp_info, policy, actor_optimizer, policy_parameters)
 
@@ -103,6 +107,8 @@ class IQL(DeepAC):
         self._tau = to_parameter(tau)
         self._fit_count = 0
         self._actor_last_loss = None # Store actor loss for logging
+        self._actor_last_bc_loss = None # Store BC loss for logging
+        self._actor_last_q_loss = None # Store Q loss for logging
         self._value_last_loss = None # Store value loss for logging
         self._last_exp_adv = None # Store exp_adv for logging
 
@@ -110,10 +116,24 @@ class IQL(DeepAC):
 
         self._squash_actions = squash_actions
         self._discrete_action_dims = discrete_action_dims
+        assert discrete_action_dims == 0, 'Discrete actions not yet supported for IQL_DP'
         self._continuous_action_dims = continuous_action_dims
         self._normalize_states = normalize_states
         self._states_mean = None
         self._states_std = None
+
+        # Optimizer deviations from mushroom_rl
+        if policy_params['use_transformer'] is True:
+            # create the transformer optimizers here and assign to self
+            self._optimizer = policy._model.net.configure_optimizers(learning_rate=policy_params['transformer_lr_actor_net'],
+                                                                weight_decay=policy_params['transformer_weight_decay_actor_net'],
+                                                                betas=policy_params['transformer_betas_actor_net'])
+            self._parameters = policy._model.parameters()
+        # remove optimizer save attribute from super class since we will use our own method to save model and optimizer instead
+        del self._save_attributes['_optimizer']
+
+        self._use_chunking = use_chunking
+
         self._schedule_actor_lr = schedule_actor_lr
         if self._schedule_actor_lr:
             max_steps = (max_replay_size * 100) // batch_size # heuristic. TODO: test
@@ -132,7 +152,7 @@ class IQL(DeepAC):
         self._add_save_attr(
             _critic_fit_params='pickle',
             _critic_predict_params='pickle',
-            _actor_predict_params='pickle',
+            # _actor_predict_params='pickle',
             _batch_size='mushroom',
             _tau='mushroom',
             _replay_memory='mushroom',
@@ -140,7 +160,7 @@ class IQL(DeepAC):
             _target_critic_approximator='mushroom',
             _value_func_approximator='mushroom',
             _value_func_optimizer='torch',
-            _actor_approximator='mushroom',
+            # _actor_approximator='mushroom',
             _squash_actions='primitive',
             _discrete_action_dims='primitive',
             _continuous_action_dims='primitive',
@@ -154,6 +174,7 @@ class IQL(DeepAC):
             _iql_beta='mushroom',
             _iql_tau='mushroom',
             _max_clamp_adv='mushroom',
+            _use_chunking='primitive',
         )
     
     def load_dataset(self, datasets, debug=False):
@@ -170,13 +191,84 @@ class IQL(DeepAC):
         
         if self._normalize_states:
             self._compute_states_mean_std(self.offline_dataset.state)
+            # update the dataset with the normalized states
+            self.offline_dataset.state = self._norm_states(self.offline_dataset.state)
+            self.offline_dataset.next_state = self._norm_states(self.offline_dataset.next_state)
+            # move devices if needed
+            self._states_mean = self._states_mean.to(TorchUtils.get_device())
+            self._states_std = self._states_std.to(TorchUtils.get_device())
         
-        # copy over offline dataset to the replay buffer
-        self._replay_memory._initial_size = len(self.offline_dataset) # set initial size to the size of the offline dataset
-        if self._replay_memory._max_size < len(self.offline_dataset):
-            print('[[Warning: Offline dataset size exceeds max replay memory size. Resizing replay memory to fit dataset.]]')
-            self._replay_memory = ReplayMemory(self.mdp_info, self.info, len(self.offline_dataset), len(self.offline_dataset))
-        self._replay_memory.add(self.offline_dataset)
+        if self._use_chunking:
+            # Make re-arranged chunked dataset to use DP-style training for policy
+            chunked_offline_dataset = dict()
+            chunked_offline_dataset['obs'] = self.offline_dataset.state
+            chunked_offline_dataset['action'] = self.offline_dataset.action
+            chunked_offline_dataset['last'] = self.offline_dataset.last
+
+            ## rearrange data based on obs_horizon, action_pred_horizon etc. as per diffusion policy
+            n_obs_steps = self.policy._n_obs_steps
+            action_horizon = self.policy._horizon
+            # rearrange into episodes
+            episodes = []
+            episode = {'obs': torch.empty((0, chunked_offline_dataset['obs'].shape[1])),
+                    'action': torch.empty((0, chunked_offline_dataset['action'].shape[1]))}
+            for i in range(len(chunked_offline_dataset['obs'])):
+                episode['obs'] = torch.vstack((episode['obs'], chunked_offline_dataset['obs'][i].unsqueeze(0)))
+                episode['action'] = torch.vstack((episode['action'], chunked_offline_dataset['action'][i].unsqueeze(0)))
+                if chunked_offline_dataset['last'][i]:
+                    episodes.append(episode)
+                    episode = {'obs': torch.empty((0, chunked_offline_dataset['obs'].shape[1])),
+                            'action': torch.empty((0, chunked_offline_dataset['action'].shape[1]))}
+                if debug and i > 2000:
+                    print("[[Debugging so skipping time consuming data rearrangement]]")
+                    break
+            # stack batches of size n_obs_steps for the obs and size horizon for the actions
+            # Note: assumption is always that n_obs_steps < action_horizon
+            # For example:
+            # "observation.state": [-0.1, 0.0],
+            # "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4],
+            rearranged_dataset = {'obs': torch.empty((0, n_obs_steps, chunked_offline_dataset['obs'].shape[1])),
+                                'action': torch.empty((0, action_horizon, chunked_offline_dataset['action'].shape[1]))}
+            for idx, episode in enumerate(episodes):
+                # stack obs
+                obs_indices = torch.arange(len(episode['obs'])).unsqueeze(1) - torch.arange(n_obs_steps-1, -1, -1)
+                # correct for indices out of range. Just pad with the first/last element
+                obs_indices = torch.clip(obs_indices, 0, len(episode['obs'])-1)
+                obs_stack = episode['obs'][obs_indices]
+                rearranged_dataset['obs'] = torch.cat((rearranged_dataset['obs'], obs_stack), dim=0)
+                # stack actions
+                act_indices = torch.arange(len(episode['action'])).unsqueeze(1) - torch.arange(n_obs_steps-1, n_obs_steps-1-action_horizon, -1)
+                # correct for indices out of range. Just pad with the first/last element
+                act_indices = torch.clip(act_indices, 0, len(episode['action'])-1)
+                act_stack = episode['action'][act_indices]
+                rearranged_dataset['action'] = torch.cat((rearranged_dataset['action'], act_stack), dim=0)
+                # TODO: make this function faster
+                if debug and idx > 5:
+                    print("[[Debugging so skipping time consuming data rearrangement]]")
+                    break
+            
+            # move devices if needed
+            rearranged_dataset['obs'] = rearranged_dataset['obs'].to(TorchUtils.get_device())
+            rearranged_dataset['action'] = rearranged_dataset['action'].to(TorchUtils.get_device())
+            
+            chunked_offline_dataset = rearranged_dataset # TODO: Test for correctness
+            
+            # Create new replay memory object and copy over offline dataset to the replay buffer
+            # Change mdp info state and action sizes to match the chunked dataset
+            new_mdp_info = deepcopy(self.mdp_info)
+            new_mdp_info.state_dim = chunked_offline_dataset['obs'].shape[1]
+            new_mdp_info.action_dim = chunked_offline_dataset['action'].shape[1]
+            self._replay_memory = ReplayMemory(new_mdp_info, self.info, initial_size=len(chunked_offline_dataset), max_size=max(self._replay_memory._max_size, len(chunked_offline_dataset)))
+            self._replay_memory.add(chunked_offline_dataset)
+            
+            self.offline_dataset = chunked_offline_dataset
+        else:
+            # No chunking, just copy over offline dataset to the replay buffer
+            self._replay_memory._initial_size = len(self.offline_dataset) # set initial size to the size of the offline dataset
+            if self._replay_memory._max_size < len(self.offline_dataset):
+                print('[[Warning: Offline dataset size exceeds max replay memory size. Resizing replay memory to fit dataset.]]')
+                self._replay_memory = ReplayMemory(self.mdp_info, self.info, len(self.offline_dataset), len(self.offline_dataset))
+            self._replay_memory.add(self.offline_dataset)
     
     def offline_fit(self, n_epochs, fit_critic=True, fit_actor=True):
         if self.offline_dataset is None:
@@ -186,12 +278,12 @@ class IQL(DeepAC):
         for epoch in trange(n_epochs):
             state, action, reward, next_state, absorbing, _ = self._replay_memory.get(self._batch_size())
 
-            if self._normalize_states:
-                state_fit = self._norm_states(state)
-                next_state_fit = self._norm_states(next_state)
-            else:
-                state_fit = state
-                next_state_fit = next_state
+            # if self._normalize_states: # Assumed done at load time
+            #     state_fit = self._norm_states(state)
+            #     next_state_fit = self._norm_states(next_state)
+            # else:
+            state_fit = state
+            next_state_fit = next_state
 
             self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, fit_actor)
     
@@ -199,12 +291,12 @@ class IQL(DeepAC):
         self._replay_memory.add(dataset)
         if self._replay_memory.initialized:
             state, action, reward, next_state, absorbing, _ = self._replay_memory.get(self._batch_size())
-            if self._normalize_states:
-                state_fit = self._norm_states(state)
-                next_state_fit = self._norm_states(next_state)
-            else:
-                state_fit = state
-                next_state_fit = next_state
+            # if self._normalize_states: # N.A.
+            #     state_fit = self._norm_states(state)
+            #     next_state_fit = self._norm_states(next_state)
+            # else:
+            state_fit = state
+            next_state_fit = next_state
             
             self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, fit_actor)
 
@@ -271,30 +363,15 @@ class IQL(DeepAC):
     def _update_actor_awr(self, adv, state, action):
         # compute advantage weighted BC loss
         exp_adv = torch.exp(self._iql_beta() * adv.detach()).clamp(max=self._max_clamp_adv)
-        
+
         # target action from data:
         act = torch.as_tensor(action, dtype=torch.float32, device=TorchUtils.get_device())
-        act_disc = act[:, :self._discrete_action_dims]
-        act_cont = act[:, -self._continuous_action_dims:]
-
-        act_pred = self._actor_approximator(state, **self._actor_predict_params)
-        act_pred_disc = act_pred[:, :self._discrete_action_dims]
-        act_pred_cont = act_pred[:, -self._continuous_action_dims:]
-        if self._squash_actions:
-            # Squash the continuous actions to [-1, 1] (Needed if RL policy squashes actions)
-            act_pred_cont = torch.tanh(act_pred_cont)
         
-        bc_loss = torch.zeros(act.shape[0], device=TorchUtils.get_device())
-        if self._discrete_action_dims > 0:
-            # ensure targets are binary
-            act_disc = (act_disc > 0.5).float()
-            # treating discrete actions as logits. Use binary cross entropy loss
-            act_pred_disc = torch.sigmoid(act_pred_disc)
-            # bc_loss += binary_cross_entropy_with_logits(act_pred_disc, act_disc)
-            bc_loss += (-act_disc * torch.log(act_pred_disc + 1e-8) - (1 - act_disc) * torch.log(1 - act_pred_disc + 1e-8)).mean(1)
-        if self._continuous_action_dims > 0:
-            # Use mse loss for continuous actions
-            bc_loss += torch.mean((act_pred_cont - act_cont)**2, dim=1)
+        # Query DP for BC loss
+        batch = {'observation.state': state, 'action': act}
+        bc_loss = self.policy.forward(batch, self._squash_actions)['loss']
+
+        # Compute actor loss
         actor_loss = torch.mean(exp_adv * bc_loss)
 
         self._optimize_actor_parameters(actor_loss)
@@ -308,33 +385,16 @@ class IQL(DeepAC):
     def _update_actor_ddpg_plus_bc(self, state, action):
         # target action from data:
         act = torch.as_tensor(action, dtype=torch.float32, device=TorchUtils.get_device())
-        act_disc = act[:, :self._discrete_action_dims]
-        act_cont = act[:, -self._continuous_action_dims:]
-
-        act_pred = self._actor_approximator(state, **self._actor_predict_params)
-        act_pred_disc = act_pred[:, :self._discrete_action_dims]
-        act_pred_cont = act_pred[:, -self._continuous_action_dims:]
-        if self._squash_actions:
-            # Squash the continuous actions to [-1, 1] (Needed if RL policy squashes actions)
-            act_pred_cont = torch.tanh(act_pred_cont)
+        
+        # Query DP for predicted action and BC loss
+        batch = {'observation.state': state, 'action': act}
+        policy_forward_output = self.policy.forward(batch, self._squash_actions)
+        act_pred = policy_forward_output['act_pred']
+        bc_loss = policy_forward_output['loss']
         
         # DDPG loss
         q = self._critic_approximator(state, act_pred, **self._critic_predict_params)
         q_loss = -q
-
-        # BC loss
-        bc_loss = torch.zeros(act.shape[0], device=TorchUtils.get_device())
-        if self._discrete_action_dims > 0:
-            # ensure targets are binary
-            act_disc = (act_disc > 0.5).float()
-            # treating discrete actions as logits. Use binary cross entropy loss
-            act_pred_disc = torch.sigmoid(act_pred_disc)
-            # bc_loss += binary_cross_entropy_with_logits(act_pred_disc, act_disc)
-            bc_loss += (-act_disc * torch.log(act_pred_disc + 1e-8) - (1 - act_disc) * torch.log(1 - act_pred_disc + 1e-8)).mean(1)
-        if self._continuous_action_dims > 0:
-            # Use mse loss for continuous actions
-            bc_loss += torch.mean((act_pred_cont - act_cont)**2, dim=1)
-        bc_loss = bc_loss
 
         # Total loss
         actor_loss = torch.mean(q_loss + self._bc_weight_in_ddpg() * bc_loss)
@@ -345,6 +405,8 @@ class IQL(DeepAC):
             self._actor_lr_scheduler.step()
 
         self._actor_last_loss = actor_loss.detach().cpu().numpy() # Store actor loss for logging
+        self._actor_last_bc_loss = bc_loss.detach().mean().cpu().numpy() # Store BC loss for logging
+        self._actor_last_q_loss = q_loss.detach().mean().cpu().numpy() # Store Q loss for logging
 
     def _asymmetric_l2_loss(self, u: torch.Tensor, tau: float):
         # loss is just L2 when u is positive, but (1 - tau) * L2 when u is negative.
