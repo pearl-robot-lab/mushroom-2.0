@@ -234,8 +234,8 @@ class DiffusionPolicy(ParametricPolicy):
             )
         # batch = self.normalize_targets(batch)
         # TODO: check if action normalization/unnormalization is needed
-        loss = self._model.compute_loss(batch, squash_actions)
-        return {"loss": loss}
+        act_pred, loss = self._model.compute_loss(batch, squash_actions)
+        return {"act_pred": act_pred, "loss": loss}
 
     def draw_action(self, state, policy_state=None):
         

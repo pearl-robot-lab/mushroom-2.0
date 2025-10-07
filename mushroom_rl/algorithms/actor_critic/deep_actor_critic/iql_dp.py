@@ -30,7 +30,6 @@ class IQL_DP(DeepAC):
                  squash_actions=False, discrete_action_dims=0, continuous_action_dims=0,
                  normalize_states=False, schedule_actor_lr=False, actor_loss_type='ddpg_plus_bc',
                  bc_weight_in_ddpg=0.25, iql_beta=1.0, iql_tau=0.7, max_clamp_adv=100.0,
-                 use_chunking=True,
                  critic_fit_params=None, actor_predict_params=None, critic_predict_params=None):
         """
         Constructor.
@@ -63,7 +62,6 @@ class IQL_DP(DeepAC):
             iql_beta ([float, Parameter], 0.25): For AWR: Inverse temperature. Small beta -> BC, big beta -> maximizing Q; when fitting on the offline dataset;
             iql_tau ([float, Parameter], 0.7): Coefficient for the asymmetric IQL loss;
             max_clamp_adv ([float, Parameter], 100.0): Maximum value considered for the advantage;
-            use_chunking (bool, True): whether to use state and action chunking for the offline dataset;
             critic_fit_params (dict, None): parameters of the fitting algorithm
                 of the critic approximator;
             actor_predict_params (dict, None): parameters for the prediction with the
@@ -132,8 +130,6 @@ class IQL_DP(DeepAC):
         # remove optimizer save attribute from super class since we will use our own method to save model and optimizer instead
         del self._save_attributes['_optimizer']
 
-        self._use_chunking = use_chunking
-
         self._schedule_actor_lr = schedule_actor_lr
         if self._schedule_actor_lr:
             max_steps = (max_replay_size * 100) // batch_size # heuristic. TODO: test
@@ -174,7 +170,6 @@ class IQL_DP(DeepAC):
             _iql_beta='mushroom',
             _iql_tau='mushroom',
             _max_clamp_adv='mushroom',
-            _use_chunking='primitive',
         )
     
     def load_dataset(self, datasets, debug=False):
@@ -192,83 +187,127 @@ class IQL_DP(DeepAC):
         if self._normalize_states:
             self._compute_states_mean_std(self.offline_dataset.state)
             # update the dataset with the normalized states
-            self.offline_dataset.state = self._norm_states(self.offline_dataset.state)
-            self.offline_dataset.next_state = self._norm_states(self.offline_dataset.next_state)
+            self.offline_dataset._data._states = self._norm_states(self.offline_dataset.state)
+            self.offline_dataset._data._next_states = self._norm_states(self.offline_dataset.next_state)
             # move devices if needed
             self._states_mean = self._states_mean.to(TorchUtils.get_device())
             self._states_std = self._states_std.to(TorchUtils.get_device())
         
-        if self._use_chunking:
-            # Make re-arranged chunked dataset to use DP-style training for policy
-            chunked_offline_dataset = dict()
-            chunked_offline_dataset['obs'] = self.offline_dataset.state
-            chunked_offline_dataset['action'] = self.offline_dataset.action
-            chunked_offline_dataset['last'] = self.offline_dataset.last
+        # Action and Q chunking:
+        # Make re-arranged chunked dataset to use DP-style training for policy and critic
 
-            ## rearrange data based on obs_horizon, action_pred_horizon etc. as per diffusion policy
-            n_obs_steps = self.policy._n_obs_steps
-            action_horizon = self.policy._horizon
-            # rearrange into episodes
-            episodes = []
-            episode = {'obs': torch.empty((0, chunked_offline_dataset['obs'].shape[1])),
-                    'action': torch.empty((0, chunked_offline_dataset['action'].shape[1]))}
-            for i in range(len(chunked_offline_dataset['obs'])):
-                episode['obs'] = torch.vstack((episode['obs'], chunked_offline_dataset['obs'][i].unsqueeze(0)))
-                episode['action'] = torch.vstack((episode['action'], chunked_offline_dataset['action'][i].unsqueeze(0)))
-                if chunked_offline_dataset['last'][i]:
-                    episodes.append(episode)
-                    episode = {'obs': torch.empty((0, chunked_offline_dataset['obs'].shape[1])),
-                            'action': torch.empty((0, chunked_offline_dataset['action'].shape[1]))}
-                if debug and i > 2000:
-                    print("[[Debugging so skipping time consuming data rearrangement]]")
-                    break
-            # stack batches of size n_obs_steps for the obs and size horizon for the actions
-            # Note: assumption is always that n_obs_steps < action_horizon
-            # For example:
-            # "observation.state": [-0.1, 0.0],
-            # "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4],
-            rearranged_dataset = {'obs': torch.empty((0, n_obs_steps, chunked_offline_dataset['obs'].shape[1])),
-                                'action': torch.empty((0, action_horizon, chunked_offline_dataset['action'].shape[1]))}
-            for idx, episode in enumerate(episodes):
-                # stack obs
-                obs_indices = torch.arange(len(episode['obs'])).unsqueeze(1) - torch.arange(n_obs_steps-1, -1, -1)
-                # correct for indices out of range. Just pad with the first/last element
-                obs_indices = torch.clip(obs_indices, 0, len(episode['obs'])-1)
-                obs_stack = episode['obs'][obs_indices]
-                rearranged_dataset['obs'] = torch.cat((rearranged_dataset['obs'], obs_stack), dim=0)
-                # stack actions
-                act_indices = torch.arange(len(episode['action'])).unsqueeze(1) - torch.arange(n_obs_steps-1, n_obs_steps-1-action_horizon, -1)
-                # correct for indices out of range. Just pad with the first/last element
-                act_indices = torch.clip(act_indices, 0, len(episode['action'])-1)
-                act_stack = episode['action'][act_indices]
-                rearranged_dataset['action'] = torch.cat((rearranged_dataset['action'], act_stack), dim=0)
-                # TODO: make this function faster
-                if debug and idx > 5:
-                    print("[[Debugging so skipping time consuming data rearrangement]]")
-                    break
-            
-            # move devices if needed
-            rearranged_dataset['obs'] = rearranged_dataset['obs'].to(TorchUtils.get_device())
-            rearranged_dataset['action'] = rearranged_dataset['action'].to(TorchUtils.get_device())
-            
-            chunked_offline_dataset = rearranged_dataset # TODO: Test for correctness
-            
-            # Create new replay memory object and copy over offline dataset to the replay buffer
-            # Change mdp info state and action sizes to match the chunked dataset
-            new_mdp_info = deepcopy(self.mdp_info)
-            new_mdp_info.state_dim = chunked_offline_dataset['obs'].shape[1]
-            new_mdp_info.action_dim = chunked_offline_dataset['action'].shape[1]
-            self._replay_memory = ReplayMemory(new_mdp_info, self.info, initial_size=len(chunked_offline_dataset), max_size=max(self._replay_memory._max_size, len(chunked_offline_dataset)))
-            self._replay_memory.add(chunked_offline_dataset)
-            
-            self.offline_dataset = chunked_offline_dataset
-        else:
-            # No chunking, just copy over offline dataset to the replay buffer
-            self._replay_memory._initial_size = len(self.offline_dataset) # set initial size to the size of the offline dataset
-            if self._replay_memory._max_size < len(self.offline_dataset):
-                print('[[Warning: Offline dataset size exceeds max replay memory size. Resizing replay memory to fit dataset.]]')
-                self._replay_memory = ReplayMemory(self.mdp_info, self.info, len(self.offline_dataset), len(self.offline_dataset))
-            self._replay_memory.add(self.offline_dataset)
+        ## rearrange data based on obs_horizon, action_pred_horizon etc. as per diffusion policy
+        n_obs_steps = self.policy._n_obs_steps
+        action_horizon = self.policy._horizon
+        # rearrange into episodes
+        episodes = []
+        episode = {'obs': torch.empty((0, self.offline_dataset.state.shape[1])),
+                    'action': torch.empty((0, self.offline_dataset.action.shape[1])),
+                    'reward': torch.empty((0, 1)),
+                    'next_obs': torch.empty((0, self.offline_dataset.next_state.shape[1])),
+                    'absorbing': torch.empty((0, 1)),
+                    'last': torch.empty((0, 1))
+                    }
+        for i in range(len(self.offline_dataset.state)):
+            episode['obs'] = torch.vstack((episode['obs'], self.offline_dataset.state[i].unsqueeze(0)))
+            episode['action'] = torch.vstack((episode['action'], self.offline_dataset.action[i].unsqueeze(0)))
+            episode['reward'] = torch.vstack((episode['reward'], self.offline_dataset.reward[i].unsqueeze(0)))
+            episode['next_obs'] = torch.vstack((episode['next_obs'], self.offline_dataset.next_state[i].unsqueeze(0)))
+            episode['absorbing'] = torch.vstack((episode['absorbing'], self.offline_dataset.absorbing[i].unsqueeze(0)))
+            episode['last'] = torch.vstack((episode['last'], self.offline_dataset.last[i].unsqueeze(0)))
+            if self.offline_dataset.last[i]:
+                episodes.append(episode)
+                episode = {'obs': torch.empty((0, self.offline_dataset.state.shape[1])),
+                            'action': torch.empty((0, self.offline_dataset.action.shape[1])),
+                            'reward': torch.empty((0, 1)),
+                            'next_obs': torch.empty((0, self.offline_dataset.next_state.shape[1])),
+                            'absorbing': torch.empty((0, 1)),
+                            'last': torch.empty((0, 1))}
+            if debug and i > 2000:
+                print("[[Debugging so skipping time consuming data rearrangement]]")
+                break
+        # stack batches of size n_obs_steps for the obs and size horizon for the actions
+        # Note: assumption is always that n_obs_steps < action_horizon
+        # For example:
+        # "observation.state": [-0.1, 0.0],
+        # "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4],
+        rearranged_dataset = {'obs': torch.empty((0, n_obs_steps, self.offline_dataset.state.shape[1])),
+                                'action': torch.empty((0, action_horizon, self.offline_dataset.action.shape[1])),
+                                'reward': torch.empty((0, self.offline_dataset.reward.shape[1])),
+                                'next_obs': torch.empty((0, n_obs_steps, self.offline_dataset.next_state.shape[1])),
+                                'absorbing': torch.empty((0, 1)),
+                                'last': torch.empty((0, 1))
+                                }
+        for idx, episode in enumerate(episodes):
+            # stack obs
+            # compute obs indices
+            obs_indices = torch.arange(len(episode['obs'])).unsqueeze(1) - torch.arange(n_obs_steps-1, -1, -1)
+            # next obs indices are with a gap of the shift due to the action chunk
+            next_obs_indices = obs_indices + action_horizon - n_obs_steps + 1
+            # correct for indices out of range. Just pad with the first/last element
+            obs_indices = torch.clip(obs_indices, 0, len(episode['obs'])-1)
+            next_obs_indices = torch.clip(next_obs_indices, 0, len(episode['next_obs'])-1)
+            obs_stack = episode['obs'][obs_indices]
+            next_obs_stack = episode['next_obs'][next_obs_indices]
+            rearranged_dataset['obs'] = torch.cat((rearranged_dataset['obs'], obs_stack), dim=0)
+            rearranged_dataset['next_obs'] = torch.cat((rearranged_dataset['next_obs'], next_obs_stack), dim=0)
+            # stack actions
+            act_indices = torch.arange(len(episode['action'])).unsqueeze(1) - torch.arange(n_obs_steps-1, n_obs_steps-1-action_horizon, -1)
+            # correct for indices out of range. Just pad with the first/last element
+            act_indices = torch.clip(act_indices, 0, len(episode['action'])-1)
+            act_stack = episode['action'][act_indices]
+            rearranged_dataset['action'] = torch.cat((rearranged_dataset['action'], act_stack), dim=0)
+            # accumulate rewards for the action chunk, zero rewards for out of range indices
+            reward_indices = torch.arange(len(episode['reward'])).unsqueeze(1) - torch.arange(n_obs_steps-1, n_obs_steps-1-action_horizon, -1)
+            episode_reward_array = torch.cat((episode['reward'], torch.zeros((1,1))), dim=0) # add zero reward at end for out of range indices
+            out_of_range = (reward_indices < 0) | (reward_indices >= len(episode['reward']))
+            reward_indices[out_of_range] = len(episode['reward']) # new end index will have a zero reward value
+            discount_powers = self.mdp_info.gamma ** torch.arange(action_horizon).unsqueeze(0)
+            discounted_rewards = episode_reward_array[reward_indices] * discount_powers.T
+            acc_rewards = torch.sum(discounted_rewards, dim=1)
+            rearranged_dataset['reward'] = torch.cat((rearranged_dataset['reward'], acc_rewards), dim=0)
+            # rearrange last and absorbing: move them forward the same amount as we moved the next_obs since they are in sync
+            absorbing_indices = torch.arange(len(episode['absorbing']))
+            absorbing_indices = absorbing_indices + action_horizon - n_obs_steps + 1
+            absorbing_indices = torch.clip(absorbing_indices, 0, len(episode['absorbing'])-1)
+            rearranged_dataset['absorbing'] = torch.cat((rearranged_dataset['absorbing'], episode['absorbing'][absorbing_indices]), dim=0)
+            last_indices = torch.arange(len(episode['last']))
+            last_indices = last_indices + action_horizon - n_obs_steps + 1
+            last_indices = torch.clip(last_indices, 0, len(episode['last'])-1)
+            rearranged_dataset['last'] = torch.cat((rearranged_dataset['last'], episode['last'][last_indices]), dim=0)
+            # TODO: make this function faster
+            if debug and idx > 5:
+                print("[[Debugging so skipping time consuming data rearrangement]]")
+                break
+        
+        # move devices if needed
+        rearranged_dataset['obs'] = rearranged_dataset['obs'].to(TorchUtils.get_device())
+        rearranged_dataset['next_obs'] = rearranged_dataset['next_obs'].to(TorchUtils.get_device())
+        rearranged_dataset['action'] = rearranged_dataset['action'].to(TorchUtils.get_device())
+        rearranged_dataset['absorbing'] = rearranged_dataset['absorbing'].to(TorchUtils.get_device())
+        rearranged_dataset['last'] = rearranged_dataset['last'].to(TorchUtils.get_device())
+        
+        TODO: roll into a single dimention for now.
+        The intermediate dimension will be reintroduced when we batch before sending to DP
+        chunked_offline_dataset = Dataset.from_array(rearranged_dataset
+        
+        # Create new replay memory object and copy over offline dataset to the replay buffer
+        # Change mdp info state and action sizes to match the chunked dataset
+        new_mdp_info = deepcopy(self.mdp_info)
+        new new_mdp_info.observation_space = chunked_offline_dataset['obs'].shape[1]
+        new new_mdp_info.action_space = chunked_offline_dataset['action'].shape[1]
+        self._replay_memory = ReplayMemory(new_mdp_info, self.info, initial_size=len(chunked_offline_dataset), max_size=max(self._replay_memory._max_size, len(chunked_offline_dataset)))
+        self._replay_memory.add(chunked_offline_dataset)
+        
+        self.offline_dataset = chunked_offline_dataset
+
+        # else:
+        #     # No chunking, just copy over offline dataset to the replay buffer
+        #     self._replay_memory._initial_size = len(self.offline_dataset) # set initial size to the size of the offline dataset
+        #     if self._replay_memory._max_size < len(self.offline_dataset):
+        #         print('[[Warning: Offline dataset size exceeds max replay memory size. Resizing replay memory to fit dataset.]]')
+        #         self._replay_memory = ReplayMemory(self.mdp_info, self.info, len(self.offline_dataset), len(self.offline_dataset))
+        #     self._replay_memory.add(self.offline_dataset)
     
     def offline_fit(self, n_epochs, fit_critic=True, fit_actor=True):
         if self.offline_dataset is None:
@@ -288,6 +327,9 @@ class IQL_DP(DeepAC):
             self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, fit_actor)
     
     def fit(self, dataset, fit_critic=True, fit_actor=True): # Online
+        raise NotImplementedError('Online fitting not yet implemented for IQL_DP')
+        # TODO: For online fitting, handle normalization and chunking
+        # norm and chunk dataset before adding it to the replay memory
         self._replay_memory.add(dataset)
         if self._replay_memory.initialized:
             state, action, reward, next_state, absorbing, _ = self._replay_memory.get(self._batch_size())
@@ -321,6 +363,8 @@ class IQL_DP(DeepAC):
                     # next_v = next_v.cpu() # TODO: check if this is needed
                 # Get advantage & update value function (if fit_critic)
                 adv = self._get_adv_and_update_v(state, action, fit_critic)
+                # Update Q function
+                self._update_q(next_v, state, action, reward, absorbing)
             elif fit_actor:
                 # Update actor
                 self._update_actor_ddpg_plus_bc(state, action)
@@ -352,7 +396,8 @@ class IQL_DP(DeepAC):
     
     def _update_q(self, next_v, state, action, reward, absorbing):
         # Compute q value
-        q = reward + (~absorbing) * self.mdp_info.gamma * next_v
+        # since we use chunking, actual gamma is gamma^action_horizon
+        q = reward + (~absorbing) * (self.mdp_info.gamma ** self.policy._horizon) * next_v
 
         # Fit critic
         self._critic_approximator.fit(state, action, q, **self._critic_fit_params)      
@@ -368,6 +413,7 @@ class IQL_DP(DeepAC):
         act = torch.as_tensor(action, dtype=torch.float32, device=TorchUtils.get_device())
         
         # Query DP for BC loss
+        TODO: roll into correct shape for DP
         batch = {'observation.state': state, 'action': act}
         bc_loss = self.policy.forward(batch, self._squash_actions)['loss']
 
@@ -387,6 +433,7 @@ class IQL_DP(DeepAC):
         act = torch.as_tensor(action, dtype=torch.float32, device=TorchUtils.get_device())
         
         # Query DP for predicted action and BC loss
+        TODO: roll into correct shape for DP
         batch = {'observation.state': state, 'action': act}
         policy_forward_output = self.policy.forward(batch, self._squash_actions)
         act_pred = policy_forward_output['act_pred']
