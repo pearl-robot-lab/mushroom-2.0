@@ -7,6 +7,7 @@ from mushroom_rl.approximators.parametric import TorchApproximator
 from mushroom_rl.rl_utils.replay_memory import ReplayMemory
 
 from mushroom_rl.core.dataset import Dataset
+from mushroom_rl.rl_utils import spaces
 from mushroom_rl.utils.minibatches import minibatch_generator
 from mushroom_rl.rl_utils.parameters import Parameter, to_parameter
 from mushroom_rl.utils.torch import TorchUtils
@@ -176,9 +177,15 @@ class IQL_DP(DeepAC):
         # there can be more than one dataset so loop over the list
         for dataset in datasets:
             # load & create mushroom dataset
-            mushroom_dataset = Dataset.from_array(dataset['obs'], dataset['action'], dataset['reward'],
-                                                    dataset['next_obs'], dataset['absorbing'], dataset['last'],
-                                                    backend='torch')
+            mushroom_dataset = Dataset.from_array(
+                dataset['obs'].astype(np.float32),
+                dataset['action'].astype(np.float32),
+                dataset['reward'].astype(np.float32),
+                dataset['next_obs'].astype(np.float32),
+                dataset['absorbing'].astype(np.float32),
+                dataset['last'].astype(np.float32),
+                backend='torch'
+            )
             if self.offline_dataset is None:
                 self.offline_dataset = mushroom_dataset
             else:
@@ -287,16 +294,29 @@ class IQL_DP(DeepAC):
         rearranged_dataset['absorbing'] = rearranged_dataset['absorbing'].to(TorchUtils.get_device())
         rearranged_dataset['last'] = rearranged_dataset['last'].to(TorchUtils.get_device())
         
-        TODO: roll into a single dimention for now.
-        The intermediate dimension will be reintroduced when we batch before sending to DP
-        chunked_offline_dataset = Dataset.from_array(rearranged_dataset
+        # Roll into a single dimension for now.
+        # The intermediate dimension will be reintroduced when we batch before sending to DP
+        # Flatten the obs and action dimensions: (batch, n_obs_steps, obs_dim) -> (batch, n_obs_steps * obs_dim)
+        obs_flat = rearranged_dataset['obs'].view(rearranged_dataset['obs'].shape[0], -1)
+        next_obs_flat = rearranged_dataset['next_obs'].view(rearranged_dataset['next_obs'].shape[0], -1)
+        action_flat = rearranged_dataset['action'].view(rearranged_dataset['action'].shape[0], -1)
+        
+        chunked_offline_dataset = Dataset.from_array(obs_flat, action_flat, rearranged_dataset['reward'],
+                                                   next_obs_flat, rearranged_dataset['absorbing'], 
+                                                   rearranged_dataset['last'], backend='torch')
         
         # Create new replay memory object and copy over offline dataset to the replay buffer
-        # Change mdp info state and action sizes to match the chunked dataset
-        new_mdp_info = deepcopy(self.mdp_info)
-        new new_mdp_info.observation_space = chunked_offline_dataset['obs'].shape[1]
-        new new_mdp_info.action_space = chunked_offline_dataset['action'].shape[1]
-        self._replay_memory = ReplayMemory(new_mdp_info, self.info, initial_size=len(chunked_offline_dataset), max_size=max(self._replay_memory._max_size, len(chunked_offline_dataset)))
+        # For the replay memory, change mdp info state and action sizes to match the chunked dataset
+        chunked_obs_size = chunked_offline_dataset.state.shape[1]
+        chunked_act_size = chunked_offline_dataset.action.shape[1]
+        replay_mdp_info = deepcopy(self.mdp_info)
+        replay_mdp_info.observation_space = spaces.Box(
+            -np.inf * np.ones(chunked_obs_size, dtype=np.float32),
+            np.inf * np.ones(chunked_obs_size, dtype=np.float32))
+        replay_mdp_info.action_space = spaces.Box(
+            -1.0 * np.ones(chunked_act_size, dtype=np.float32),
+            1.0 * np.ones(chunked_act_size, dtype=np.float32))
+        self._replay_memory = ReplayMemory(replay_mdp_info, self.info, initial_size=len(chunked_offline_dataset), max_size=max(self._replay_memory._max_size, len(chunked_offline_dataset)))
         self._replay_memory.add(chunked_offline_dataset)
         
         self.offline_dataset = chunked_offline_dataset
@@ -324,8 +344,13 @@ class IQL_DP(DeepAC):
             state_fit = state
             next_state_fit = next_state
 
-            self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, fit_actor)
-    
+            if self._actor_loss_type == 'ddpg_plus_bc' and fit_critic == fit_actor:
+                # For DDPG+BC, fit critic first, then actor
+                self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, False)
+                self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, False, fit_actor)
+            else:
+                self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, fit_actor)
+
     def fit(self, dataset, fit_critic=True, fit_actor=True): # Online
         raise NotImplementedError('Online fitting not yet implemented for IQL_DP')
         # TODO: For online fitting, handle normalization and chunking
@@ -340,13 +365,18 @@ class IQL_DP(DeepAC):
             state_fit = state
             next_state_fit = next_state
             
-            self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, fit_actor)
+            if self._actor_loss_type == 'ddpg_plus_bc' and fit_critic == fit_actor:
+                # For DDPG+BC, fit critic first, then actor
+                self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, False)
+                self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, False, fit_actor)
+            else:
+                self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, fit_actor)
 
     def iql_fit(self, state, action, reward, next_state, absorbing, fit_critic=True, fit_actor=True):
         if self._actor_loss_type == 'awr':
             with torch.no_grad():
                 next_v = self._value_func_approximator(next_state, **self._critic_predict_params)
-                # next_v = next_v.cpu() # TODO: check if this is needed
+                next_v = next_v.cpu()
             # Get advantage & update value function (if fit_critic)
             adv = self._get_adv_and_update_v(state, action, fit_critic)
             if fit_critic:
@@ -356,11 +386,10 @@ class IQL_DP(DeepAC):
                 # Update actor
                 self._update_actor_awr(adv, state, action)
         elif self._actor_loss_type == 'ddpg_plus_bc':
-            assert fit_critic != fit_actor, 'fit_critic and fit_actor cannot be True at the same time for DDPG_BC'
             if fit_critic:
                 with torch.no_grad():
                     next_v = self._value_func_approximator(next_state, **self._critic_predict_params)
-                    # next_v = next_v.cpu() # TODO: check if this is needed
+                    next_v = next_v.cpu()
                 # Get advantage & update value function (if fit_critic)
                 adv = self._get_adv_and_update_v(state, action, fit_critic)
                 # Update Q function
@@ -413,8 +442,7 @@ class IQL_DP(DeepAC):
         act = torch.as_tensor(action, dtype=torch.float32, device=TorchUtils.get_device())
         
         # Query DP for BC loss
-        TODO: roll into correct shape for DP
-        batch = {'observation.state': state, 'action': act}
+        batch = self._create_batch_for_dp(state, act)
         bc_loss = self.policy.forward(batch, self._squash_actions)['loss']
 
         # Compute actor loss
@@ -429,18 +457,20 @@ class IQL_DP(DeepAC):
         self._last_exp_adv = exp_adv.detach().mean().cpu().numpy() # Store exp_adv for logging
 
     def _update_actor_ddpg_plus_bc(self, state, action):
-        # target action from data:
+        # target state, action from data:
         act = torch.as_tensor(action, dtype=torch.float32, device=TorchUtils.get_device())
+        state_tensor = torch.as_tensor(state, dtype=torch.float32, device=TorchUtils.get_device())
         
         # Query DP for predicted action and BC loss
-        TODO: roll into correct shape for DP
-        batch = {'observation.state': state, 'action': act}
+        batch = self._create_batch_for_dp(state_tensor, act)
         policy_forward_output = self.policy.forward(batch, self._squash_actions)
         act_pred = policy_forward_output['act_pred']
         bc_loss = policy_forward_output['loss']
-        
-        # DDPG loss
-        q = self._critic_approximator(state, act_pred, **self._critic_predict_params)
+        bc_loss = bc_loss.mean((1,2)) # mean over action dim and horizon dim to get (batch,)
+
+        # DDPG loss - need to flatten the predicted action for the critic
+        act_pred_flat = self._flatten_action_for_critic(act_pred).cpu()
+        q = self._critic_approximator(state_tensor, act_pred_flat, **self._critic_predict_params)
         q_loss = -q
 
         # Total loss
@@ -454,6 +484,25 @@ class IQL_DP(DeepAC):
         self._actor_last_loss = actor_loss.detach().cpu().numpy() # Store actor loss for logging
         self._actor_last_bc_loss = bc_loss.detach().mean().cpu().numpy() # Store BC loss for logging
         self._actor_last_q_loss = q_loss.detach().mean().cpu().numpy() # Store Q loss for logging
+
+    def _create_batch_for_dp(self, state, action):
+        """Create batch dictionary for Diffusion Policy with reshaped tensors."""
+        n_obs_steps = self.policy._n_obs_steps
+        action_horizon = self.policy._horizon
+        obs_dim = self.mdp_info.observation_space.shape[0]  # Original observation dimension
+        act_dim = self.mdp_info.action_space.shape[0]  # Original action dimension
+        
+        state_reshaped = state.view(-1, n_obs_steps, obs_dim)
+        action_reshaped = action.view(-1, action_horizon, act_dim)
+        
+        batch = {'observation.state': state_reshaped, 'action': action_reshaped}
+        return batch
+
+    def _flatten_action_for_critic(self, action_tensor):
+        """Flatten action tensor for critic network."""
+        action_horizon = self.policy._horizon
+        act_dim = self.mdp_info.action_space.shape[0]
+        return action_tensor.view(-1, action_horizon * act_dim)
 
     def _asymmetric_l2_loss(self, u: torch.Tensor, tau: float):
         # loss is just L2 when u is positive, but (1 - tau) * L2 when u is negative.

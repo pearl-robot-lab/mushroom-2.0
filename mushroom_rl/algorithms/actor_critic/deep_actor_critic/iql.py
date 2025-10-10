@@ -212,7 +212,7 @@ class IQL(DeepAC):
         if self._actor_loss_type == 'awr':
             with torch.no_grad():
                 next_v = self._value_func_approximator(next_state, **self._critic_predict_params)
-                # next_v = next_v.cpu() # TODO: check if this is needed
+                next_v = next_v.cpu()
             # Get advantage & update value function (if fit_critic)
             adv = self._get_adv_and_update_v(state, action, fit_critic)
             if fit_critic:
@@ -226,7 +226,7 @@ class IQL(DeepAC):
             if fit_critic:
                 with torch.no_grad():
                     next_v = self._value_func_approximator(next_state, **self._critic_predict_params)
-                    # next_v = next_v.cpu() # TODO: check if this is needed
+                    next_v = next_v.cpu()
                 # Get advantage & update value function (if fit_critic)
                 adv = self._get_adv_and_update_v(state, action, fit_critic)
             elif fit_actor:
