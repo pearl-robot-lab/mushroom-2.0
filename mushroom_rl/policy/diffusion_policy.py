@@ -251,6 +251,9 @@ class DiffusionPolicy(ParametricPolicy):
             if self._normalize_states:
                 if self._states_mean is None:
                     raise ValueError('States mean is not set by the agent class')
+                if self._states_mean.device != state.device:
+                    self._states_mean = self._states_mean.to(state.device)
+                    self._states_std = self._states_std.to(state.device)
                 state_query = (state - self._states_mean) / self._states_std
             else:
                 state_query = state
@@ -268,6 +271,9 @@ class DiffusionPolicy(ParametricPolicy):
             if self._normalize_actions:
                 if self._actions_mean is None:
                     raise ValueError('Actions mean is not set by the agent class')
+                if self._actions_mean.device != mu.device:
+                    self._actions_mean = self._actions_mean.to(mu.device)
+                    self._actions_std = self._actions_std.to(mu.device)
                 mu = mu * self._actions_std + self._actions_mean
 
             # sample continuous actions from distribution
@@ -307,12 +313,18 @@ class DiffusionPolicy(ParametricPolicy):
                 if self._normalize_states:
                     if self._states_mean is None:
                         raise ValueError('States mean is not set by the agent class')
+                    if self._states_mean.device != state_query.device:
+                        self._states_mean = self._states_mean.to(state_query.device)
+                        self._states_std = self._states_std.to(state_query.device)
                     state_query = (state_query - self._states_mean) / self._states_std
             ## Debug end
             else:
                 if self._normalize_states:
                     if self._states_mean is None:
                         raise ValueError('States mean is not set by the agent class')
+                    if self._states_mean.device != state.device:
+                        self._states_mean = self._states_mean.to(state.device)
+                        self._states_std = self._states_std.to(state.device)
                     state_query = (state - self._states_mean) / self._states_std
                 else:
                     state_query = state

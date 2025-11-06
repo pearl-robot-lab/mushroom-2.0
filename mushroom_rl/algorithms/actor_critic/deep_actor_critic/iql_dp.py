@@ -11,7 +11,7 @@ from mushroom_rl.rl_utils import spaces
 from mushroom_rl.utils.minibatches import minibatch_generator
 from mushroom_rl.rl_utils.parameters import Parameter, to_parameter
 from mushroom_rl.utils.torch import TorchUtils
-from tqdm import trange
+from tqdm import tqdm, trange
 from copy import deepcopy
 
 # from torch.nn.functional import binary_cross_entropy_with_logits
@@ -145,6 +145,11 @@ class IQL_DP(DeepAC):
         self._max_clamp_adv = to_parameter(max_clamp_adv)
         
         self.offline_dataset = None
+        self.optimal_dataset = None  # Store optimal dataset for critic error computation
+        self.offline_episode_starts = None  # Episode boundaries for offline dataset
+        self.offline_episode_ends = None
+        self.optimal_episode_starts = None  # Episode boundaries for optimal dataset
+        self.optimal_episode_ends = None
 
         self._add_save_attr(
             _critic_fit_params='pickle',
@@ -173,11 +178,58 @@ class IQL_DP(DeepAC):
             _max_clamp_adv='mushroom',
         )
     
-    def load_dataset(self, datasets, debug=False):
+    def _get_episode_boundaries(self, dataset):
+        """
+        Find episode boundaries in a dataset using the 'last' flag.
+        
+        Args:
+            dataset: Dataset object with 'last' attribute indicating episode ends
+        
+        Returns:
+            tuple: (episode_starts, episode_ends) - lists of start and end indices for each episode
+        """
+        # Convert last to boolean if needed (handle both bool and numeric types)
+        last_array = dataset.last.squeeze() if dataset.last.dim() > 1 else dataset.last
+        if last_array.dtype != torch.bool:
+            last_array = last_array.bool()
+        # Find all episode end indices (where last[i] == True)
+        episode_end_indices = torch.where(last_array)[0].cpu().numpy()
+        # Compute episode start and end indices
+        if len(episode_end_indices) > 0:
+            episode_starts = [0] + (episode_end_indices[:-1] + 1).tolist()
+            episode_ends = (episode_end_indices + 1).tolist()
+            # Handle case where dataset doesn't end with last=True
+            # Include remaining samples as the last episode
+            if episode_ends[-1] < len(dataset.state):
+                episode_starts.append(episode_ends[-1])
+                episode_ends.append(len(dataset.state))
+        else:
+            # No episode boundaries found - treat entire dataset as one episode
+            episode_starts = [0]
+            episode_ends = [len(dataset.state)]
+        
+        return episode_starts, episode_ends
+    
+    def _load_and_chunk_dataset(self, datasets, compute_mean_std=True, debug=False):
+        """
+        Shared helper function to load datasets and perform chunking.
+        Handles loading, normalization, episode rearrangement, and chunking.
+        
+        Args:
+            datasets: list of dictionaries with keys: obs, action, reward, next_obs, absorbing, last
+            compute_mean_std: whether to compute mean/std for normalization (only used if normalize_states=True)
+            debug: if True, skip time-consuming data rearrangement for debugging
+        
+        Returns:
+            chunked_dataset: Dataset object with chunked data ready for training
+            episode_starts: list of start indices for each episode
+            episode_ends: list of end indices for each episode
+        """
         # there can be more than one dataset so loop over the list
+        mushroom_dataset = None
         for dataset in datasets:
             # load & create mushroom dataset
-            mushroom_dataset = Dataset.from_array(
+            dataset_obj = Dataset.from_array(
                 dataset['obs'].astype(np.float32),
                 dataset['action'].astype(np.float32),
                 dataset['reward'].astype(np.float32),
@@ -186,19 +238,17 @@ class IQL_DP(DeepAC):
                 dataset['last'].astype(np.float32),
                 backend='torch'
             )
-            if self.offline_dataset is None:
-                self.offline_dataset = mushroom_dataset
+            if mushroom_dataset is None:
+                mushroom_dataset = dataset_obj
             else:
-                self.offline_dataset += mushroom_dataset
+                mushroom_dataset += dataset_obj
         
         if self._normalize_states:
-            self._compute_states_mean_std(self.offline_dataset.state)
+            if compute_mean_std:
+                self._compute_states_mean_std(mushroom_dataset.state)
             # update the dataset with the normalized states
-            self.offline_dataset._data._states = self._norm_states(self.offline_dataset.state)
-            self.offline_dataset._data._next_states = self._norm_states(self.offline_dataset.next_state)
-            # move devices if needed
-            self._states_mean = self._states_mean.to(TorchUtils.get_device())
-            self._states_std = self._states_std.to(TorchUtils.get_device())
+            mushroom_dataset._data._states = self._norm_states(mushroom_dataset.state)
+            mushroom_dataset._data._next_states = self._norm_states(mushroom_dataset.next_state)
         
         # Action and Q chunking:
         # Make re-arranged chunked dataset to use DP-style training for policy and critic
@@ -206,42 +256,36 @@ class IQL_DP(DeepAC):
         ## rearrange data based on obs_horizon, action_pred_horizon etc. as per diffusion policy
         n_obs_steps = self.policy._n_obs_steps
         action_horizon = self.policy._horizon
-        # rearrange into episodes
+        # Find episode boundaries using the 'last' array
+        episode_starts, episode_ends = self._get_episode_boundaries(mushroom_dataset)
+        # Limit episodes for debugging
+        if debug:
+            max_episodes = 5
+            episode_starts = episode_starts[:max_episodes]
+            episode_ends = episode_ends[:max_episodes]
+            print(f"[[Debugging so processing only {len(episode_starts)} episodes]]")
+        
+        # Create episodes by slicing the original arrays directly
         episodes = []
-        episode = {'obs': torch.empty((0, self.offline_dataset.state.shape[1])),
-                    'action': torch.empty((0, self.offline_dataset.action.shape[1])),
-                    'reward': torch.empty((0, 1)),
-                    'next_obs': torch.empty((0, self.offline_dataset.next_state.shape[1])),
-                    'absorbing': torch.empty((0, 1)),
-                    'last': torch.empty((0, 1))
-                    }
-        for i in range(len(self.offline_dataset.state)):
-            episode['obs'] = torch.vstack((episode['obs'], self.offline_dataset.state[i].unsqueeze(0)))
-            episode['action'] = torch.vstack((episode['action'], self.offline_dataset.action[i].unsqueeze(0)))
-            episode['reward'] = torch.vstack((episode['reward'], self.offline_dataset.reward[i].unsqueeze(0)))
-            episode['next_obs'] = torch.vstack((episode['next_obs'], self.offline_dataset.next_state[i].unsqueeze(0)))
-            episode['absorbing'] = torch.vstack((episode['absorbing'], self.offline_dataset.absorbing[i].unsqueeze(0)))
-            episode['last'] = torch.vstack((episode['last'], self.offline_dataset.last[i].unsqueeze(0)))
-            if self.offline_dataset.last[i]:
-                episodes.append(episode)
-                episode = {'obs': torch.empty((0, self.offline_dataset.state.shape[1])),
-                            'action': torch.empty((0, self.offline_dataset.action.shape[1])),
-                            'reward': torch.empty((0, 1)),
-                            'next_obs': torch.empty((0, self.offline_dataset.next_state.shape[1])),
-                            'absorbing': torch.empty((0, 1)),
-                            'last': torch.empty((0, 1))}
-            if debug and i > 2000:
-                print("[[Debugging so skipping time consuming data rearrangement]]")
-                break
+        for start_idx, end_idx in zip(episode_starts, episode_ends):
+            episode = {
+                'obs': mushroom_dataset.state[start_idx:end_idx],
+                'action': mushroom_dataset.action[start_idx:end_idx],
+                'reward': mushroom_dataset.reward[start_idx:end_idx],
+                'next_obs': mushroom_dataset.next_state[start_idx:end_idx],
+                'absorbing': mushroom_dataset.absorbing[start_idx:end_idx],
+                'last': mushroom_dataset.last[start_idx:end_idx]
+            }
+            episodes.append(episode)
         # stack batches of size n_obs_steps for the obs and size horizon for the actions
         # Note: assumption is always that n_obs_steps < action_horizon
         # For example:
         # "observation.state": [-0.1, 0.0],
         # "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4],
-        rearranged_dataset = {'obs': torch.empty((0, n_obs_steps, self.offline_dataset.state.shape[1])),
-                                'action': torch.empty((0, action_horizon, self.offline_dataset.action.shape[1])),
-                                'reward': torch.empty((0, self.offline_dataset.reward.shape[1])),
-                                'next_obs': torch.empty((0, n_obs_steps, self.offline_dataset.next_state.shape[1])),
+        rearranged_dataset = {'obs': torch.empty((0, n_obs_steps, mushroom_dataset.state.shape[1])),
+                                'action': torch.empty((0, action_horizon, mushroom_dataset.action.shape[1])),
+                                'reward': torch.empty((0, mushroom_dataset.reward.shape[1])),
+                                'next_obs': torch.empty((0, n_obs_steps, mushroom_dataset.next_state.shape[1])),
                                 'absorbing': torch.empty((0, 1)),
                                 'last': torch.empty((0, 1))
                                 }
@@ -250,7 +294,7 @@ class IQL_DP(DeepAC):
             # compute obs indices
             obs_indices = torch.arange(len(episode['obs'])).unsqueeze(1) - torch.arange(n_obs_steps-1, -1, -1)
             # next obs indices are with a gap of the shift due to the action chunk
-            next_obs_indices = obs_indices + action_horizon - n_obs_steps + 1
+            next_obs_indices = obs_indices + action_horizon - n_obs_steps
             # correct for indices out of range. Just pad with the first/last element
             obs_indices = torch.clip(obs_indices, 0, len(episode['obs'])-1)
             next_obs_indices = torch.clip(next_obs_indices, 0, len(episode['next_obs'])-1)
@@ -275,11 +319,11 @@ class IQL_DP(DeepAC):
             rearranged_dataset['reward'] = torch.cat((rearranged_dataset['reward'], acc_rewards), dim=0)
             # rearrange last and absorbing: move them forward the same amount as we moved the next_obs since they are in sync
             absorbing_indices = torch.arange(len(episode['absorbing']))
-            absorbing_indices = absorbing_indices + action_horizon - n_obs_steps + 1
+            absorbing_indices = absorbing_indices + action_horizon - n_obs_steps
             absorbing_indices = torch.clip(absorbing_indices, 0, len(episode['absorbing'])-1)
             rearranged_dataset['absorbing'] = torch.cat((rearranged_dataset['absorbing'], episode['absorbing'][absorbing_indices]), dim=0)
             last_indices = torch.arange(len(episode['last']))
-            last_indices = last_indices + action_horizon - n_obs_steps + 1
+            last_indices = last_indices + action_horizon - n_obs_steps
             last_indices = torch.clip(last_indices, 0, len(episode['last'])-1)
             rearranged_dataset['last'] = torch.cat((rearranged_dataset['last'], episode['last'][last_indices]), dim=0)
             # TODO: make this function faster
@@ -288,11 +332,12 @@ class IQL_DP(DeepAC):
                 break
         
         # move devices if needed
-        rearranged_dataset['obs'] = rearranged_dataset['obs'].to(TorchUtils.get_device())
-        rearranged_dataset['next_obs'] = rearranged_dataset['next_obs'].to(TorchUtils.get_device())
-        rearranged_dataset['action'] = rearranged_dataset['action'].to(TorchUtils.get_device())
-        rearranged_dataset['absorbing'] = rearranged_dataset['absorbing'].to(TorchUtils.get_device())
-        rearranged_dataset['last'] = rearranged_dataset['last'].to(TorchUtils.get_device())
+        # rearranged_dataset['obs'] = rearranged_dataset['obs'].to(TorchUtils.get_device())
+        # rearranged_dataset['action'] = rearranged_dataset['action'].to(TorchUtils.get_device())
+        # rearranged_dataset['reward'] = rearranged_dataset['reward'].to(TorchUtils.get_device())
+        # rearranged_dataset['next_obs'] = rearranged_dataset['next_obs'].to(TorchUtils.get_device())
+        # rearranged_dataset['absorbing'] = rearranged_dataset['absorbing'].to(TorchUtils.get_device())
+        # rearranged_dataset['last'] = rearranged_dataset['last'].to(TorchUtils.get_device())
         
         # Roll into a single dimension for now.
         # The intermediate dimension will be reintroduced when we batch before sending to DP
@@ -301,25 +346,34 @@ class IQL_DP(DeepAC):
         next_obs_flat = rearranged_dataset['next_obs'].view(rearranged_dataset['next_obs'].shape[0], -1)
         action_flat = rearranged_dataset['action'].view(rearranged_dataset['action'].shape[0], -1)
         
-        chunked_offline_dataset = Dataset.from_array(obs_flat, action_flat, rearranged_dataset['reward'],
+        chunked_dataset = Dataset.from_array(obs_flat, action_flat, rearranged_dataset['reward'],
                                                    next_obs_flat, rearranged_dataset['absorbing'], 
                                                    rearranged_dataset['last'], backend='torch')
         
+        return chunked_dataset, episode_starts, episode_ends
+    
+    def load_dataset(self, datasets, compute_mean_std=True, debug=False):
+        # Load and chunk the dataset using the shared helper function
+        chunked_offline_dataset, offline_episode_starts, offline_episode_ends = self._load_and_chunk_dataset(datasets, compute_mean_std, debug)
+        
+        # Optional: load into replay memory for offline-to-online training (Later)
         # Create new replay memory object and copy over offline dataset to the replay buffer
         # For the replay memory, change mdp info state and action sizes to match the chunked dataset
-        chunked_obs_size = chunked_offline_dataset.state.shape[1]
-        chunked_act_size = chunked_offline_dataset.action.shape[1]
-        replay_mdp_info = deepcopy(self.mdp_info)
-        replay_mdp_info.observation_space = spaces.Box(
-            -np.inf * np.ones(chunked_obs_size, dtype=np.float32),
-            np.inf * np.ones(chunked_obs_size, dtype=np.float32))
-        replay_mdp_info.action_space = spaces.Box(
-            -1.0 * np.ones(chunked_act_size, dtype=np.float32),
-            1.0 * np.ones(chunked_act_size, dtype=np.float32))
-        self._replay_memory = ReplayMemory(replay_mdp_info, self.info, initial_size=len(chunked_offline_dataset), max_size=max(self._replay_memory._max_size, len(chunked_offline_dataset)))
-        self._replay_memory.add(chunked_offline_dataset)
+        # chunked_obs_size = chunked_offline_dataset.state.shape[1]
+        # chunked_act_size = chunked_offline_dataset.action.shape[1]
+        # replay_mdp_info = deepcopy(self.mdp_info)
+        # replay_mdp_info.observation_space = spaces.Box(
+        #     -np.inf * np.ones(chunked_obs_size, dtype=np.float32),
+        #     np.inf * np.ones(chunked_obs_size, dtype=np.float32))
+        # replay_mdp_info.action_space = spaces.Box(
+        #     -1.0 * np.ones(chunked_act_size, dtype=np.float32),
+        #     1.0 * np.ones(chunked_act_size, dtype=np.float32))
+        # self._replay_memory = ReplayMemory(replay_mdp_info, self.info, initial_size=len(chunked_offline_dataset), max_size=max(self._replay_memory._max_size, len(chunked_offline_dataset)))
+        # self._replay_memory.add(chunked_offline_dataset)
         
         self.offline_dataset = chunked_offline_dataset
+        self.offline_episode_starts = offline_episode_starts
+        self.offline_episode_ends = offline_episode_ends
 
         # else:
         #     # No chunking, just copy over offline dataset to the replay buffer
@@ -329,27 +383,91 @@ class IQL_DP(DeepAC):
         #         self._replay_memory = ReplayMemory(self.mdp_info, self.info, len(self.offline_dataset), len(self.offline_dataset))
         #     self._replay_memory.add(self.offline_dataset)
     
+    def load_optimal_dataset(self, datasets, compute_mean_std=True, debug=False):
+        """
+        Load optimal dataset for computing critic errors.
+        Similar to load_dataset but stores the optimal dataset separately.
+        
+        Args:
+            datasets: list of dictionaries with keys: obs, action, reward, next_obs, absorbing, last
+            compute_mean_std: whether to compute mean/std for normalization (uses same normalization as offline dataset)
+            debug: if True, skip time-consuming data rearrangement for debugging
+        """
+        # Check that mean/std are already computed if normalize_states is True
+        if self._normalize_states and compute_mean_std:
+            if self._states_mean is None or self._states_std is None:
+                raise ValueError('States mean and std not computed yet. Call load_dataset() first.')
+        
+        # Load and chunk the dataset using the shared helper function
+        # Pass compute_mean_std=False since we should use existing normalization
+        chunked_optimal_dataset, optimal_episode_starts, optimal_episode_ends = self._load_and_chunk_dataset(datasets, compute_mean_std=False, debug=debug)
+
+        self.optimal_dataset = chunked_optimal_dataset
+        self.optimal_episode_starts = optimal_episode_starts
+        self.optimal_episode_ends = optimal_episode_ends
+    
     def offline_fit(self, n_epochs, fit_critic=True, fit_actor=True):
         if self.offline_dataset is None:
             raise ValueError('No offline dataset loaded!. Call load_dataset() first.')
         
+        # Initialize lists to accumulate losses for averaging
+        acc_actor_loss = []
+        acc_value_loss = []
+        acc_exp_adv = []
+        acc_actor_bc_loss = []
+        acc_actor_q_loss = []
+        
         # fit on the dataset (for n_epochs)
-        for epoch in trange(n_epochs):
-            state, action, reward, next_state, absorbing, _ = self._replay_memory.get(self._batch_size())
+        # for epoch in trange(n_epochs):
+        #     state, action, reward, next_state, absorbing, _ = self._replay_memory.get(self._batch_size())
+        epoch_count = 0
+        with tqdm(total=n_epochs) as pbar:
+            for state, action, reward, next_state, absorbing in minibatch_generator(
+                self._batch_size(), self.offline_dataset.state, self.offline_dataset.action,
+                self.offline_dataset.reward, self.offline_dataset.next_state, self.offline_dataset.absorbing):
 
-            # if self._normalize_states: # Assumed done at load time
-            #     state_fit = self._norm_states(state)
-            #     next_state_fit = self._norm_states(next_state)
-            # else:
-            state_fit = state
-            next_state_fit = next_state
+                # if self._normalize_states: # Assumed done at load time
+                #     state_fit = self._norm_states(state)
+                #     next_state_fit = self._norm_states(next_state)
+                # else:
+                state_fit = state
+                next_state_fit = next_state
 
-            if self._actor_loss_type == 'ddpg_plus_bc' and fit_critic == fit_actor:
-                # For DDPG+BC, fit critic first, then actor
-                self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, False)
-                self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, False, fit_actor)
-            else:
-                self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, fit_actor)
+                if self._actor_loss_type == 'ddpg_plus_bc' and fit_critic == fit_actor:
+                    # For DDPG+BC, fit critic first, then actor
+                    self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, False)
+                    self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, False, fit_actor)
+                else:
+                    self.iql_fit(state_fit, action, reward, next_state_fit, absorbing, fit_critic, fit_actor)
+                
+                # Accumulate losses for averaging
+                if self._actor_last_loss is not None:
+                    acc_actor_loss.append(self._actor_last_loss)
+                if self._value_last_loss is not None:
+                    acc_value_loss.append(self._value_last_loss)
+                if self._last_exp_adv is not None:
+                    acc_exp_adv.append(self._last_exp_adv)
+                if self._actor_last_bc_loss is not None:
+                    acc_actor_bc_loss.append(self._actor_last_bc_loss)
+                if self._actor_last_q_loss is not None:
+                    acc_actor_q_loss.append(self._actor_last_q_loss)
+                
+                epoch_count += 1
+                pbar.update(1)
+                if epoch_count >= n_epochs:
+                    break
+        
+        # Store averaged losses for logging
+        if len(acc_actor_loss) > 0:
+            self._actor_last_loss = np.mean(acc_actor_loss)
+        if len(acc_value_loss) > 0:
+            self._value_last_loss = np.mean(acc_value_loss)
+        if len(acc_exp_adv) > 0:
+            self._last_exp_adv = np.mean(acc_exp_adv)
+        if len(acc_actor_bc_loss) > 0:
+            self._actor_last_bc_loss = np.mean(acc_actor_bc_loss)
+        if len(acc_actor_q_loss) > 0:
+            self._actor_last_q_loss = np.mean(acc_actor_q_loss)
 
     def fit(self, dataset, fit_critic=True, fit_actor=True): # Online
         raise NotImplementedError('Online fitting not yet implemented for IQL_DP')
@@ -468,13 +586,15 @@ class IQL_DP(DeepAC):
         bc_loss = policy_forward_output['loss']
         bc_loss = bc_loss.mean((1,2)) # mean over action dim and horizon dim to get (batch,)
 
-        # DDPG loss - need to flatten the predicted action for the critic
-        act_pred_flat = self._flatten_action_for_critic(act_pred).cpu()
-        q = self._critic_approximator(state_tensor, act_pred_flat, **self._critic_predict_params)
-        q_loss = -q
+        actor_loss = bc_loss.mean()
+        q_loss = torch.tensor(0.0).to(TorchUtils.get_device())
+        # # DDPG loss - need to flatten the predicted action for the critic
+        # act_pred_flat = self._flatten_action_for_critic(act_pred).cpu()
+        # q = self._critic_approximator(state_tensor, act_pred_flat, **self._critic_predict_params)
+        # q_loss = -q
 
         # Total loss
-        actor_loss = torch.mean(q_loss + self._bc_weight_in_ddpg() * bc_loss)
+        # actor_loss = torch.mean(q_loss + self._bc_weight_in_ddpg() * bc_loss)
 
         self._optimize_actor_parameters(actor_loss)
         
@@ -521,6 +641,188 @@ class IQL_DP(DeepAC):
         if self._states_mean is None or self._states_std is None:
             raise ValueError('States mean and std not computed yet. Call _compute_states_mean_std() on the dataset first.')
         return (states - self._states_mean) / self._states_std
+    
+    def compute_critic_errors(self, optimal_data_percent=0.1):
+        """
+        Compute critic errors on the optimal dataset.
+        Args:
+            optimal_data_percent: percentage of the optimal dataset to sample
+        
+        Returns:
+            dict: dictionary containing critic error metrics
+        """
+        if self.optimal_dataset is None:
+            raise ValueError('No optimal dataset loaded!. Call load_optimal_dataset() first.')
+        if self.offline_dataset is None:
+            raise ValueError('No offline dataset loaded!. Call load_dataset() first.')
+
+        # Use saved episode boundaries (computed when datasets were loaded)
+        optimal_episode_starts = self.optimal_episode_starts
+        optimal_episode_ends = self.optimal_episode_ends
+        n_optimal_episodes = len(optimal_episode_starts)
+        n_samples_optimal = max(1, int(n_optimal_episodes * optimal_data_percent))
+        sampled_optimal_episode_indices = np.random.choice(n_optimal_episodes, size=min(n_samples_optimal, n_optimal_episodes), replace=False)
+        
+        # Use saved episode boundaries for offline dataset
+        offline_episode_starts = self.offline_episode_starts
+        offline_episode_ends = self.offline_episode_ends
+        n_offline_episodes = len(offline_episode_starts)
+        n_samples_offline = min(n_samples_optimal, n_offline_episodes)
+        sampled_offline_episode_indices = np.random.choice(n_offline_episodes, size=n_samples_offline, replace=False)
+        
+        # Initialize lists to accumulate errors
+        optimal_critic_errors = []
+        optimal_critic_values = []
+        offline_critic_errors = []
+        offline_critic_values = []
+        
+        gamma_horizon = self.mdp_info.gamma ** self.policy._horizon
+        
+        # Loop over sampled optimal episodes
+        for ep_idx in sampled_optimal_episode_indices:
+            start_idx = optimal_episode_starts[ep_idx]
+            end_idx = optimal_episode_ends[ep_idx]
+            episode_length = end_idx - start_idx
+            
+            # Extract episode data
+            episode_states = self.optimal_dataset.state[start_idx:end_idx]
+            episode_actions = self.optimal_dataset.action[start_idx:end_idx]
+            episode_rewards = self.optimal_dataset.reward[start_idx:end_idx]
+            
+            # Compute true Q values for each state-action pair
+            # Q(s_i, a_i) = r_i + gamma^horizon * (discounted return from next state forward)
+            # Compute future returns backwards using fully vectorized operations
+            if episode_rewards.dim() > 1:
+                rewards_tensor = episode_rewards.squeeze()
+            else:
+                rewards_tensor = episode_rewards
+            
+            # Shift rewards forward by 1 (rewards[i+1] for future return at i)
+            # Pad with 0 at the end since last state has no future
+            shifted_rewards = torch.cat([rewards_tensor[1:], torch.zeros(1, device=rewards_tensor.device, dtype=rewards_tensor.dtype)])
+            # Compute future returns using fully vectorized backward recurrence
+            # future_returns[i] = shifted_rewards[i] + gamma_horizon * future_returns[i+1]
+            # Use reversed arrays and vectorized cumulative operations
+            future_returns = torch.zeros(episode_length, device=rewards_tensor.device, dtype=torch.float32)
+            
+            if episode_length > 1:
+                # Reverse arrays for forward computation (backward in original order)
+                rev_rewards = torch.flip(shifted_rewards[:-1], [0])
+                n = len(rev_rewards)
+                # Build discount matrix: for position i, discount from j to i is gamma^(i-j)
+                # Create indices for discount computation
+                i_indices = torch.arange(n, device=rewards_tensor.device, dtype=torch.float32).unsqueeze(1)
+                j_indices = torch.arange(n, device=rewards_tensor.device, dtype=torch.float32).unsqueeze(0)
+                # Create lower triangular discount matrix (only i >= j)
+                discount_matrix = torch.where(
+                    i_indices >= j_indices,
+                    gamma_horizon ** (i_indices - j_indices),
+                    torch.zeros_like(i_indices, dtype=torch.float32)
+                )
+                # Compute future returns: matrix multiplication with discounting
+                # Each row i sums discounted rewards from 0 to i
+                rev_future_returns = torch.sum(discount_matrix * rev_rewards.unsqueeze(0).expand(n, n), dim=1)
+                
+                # Reverse back to original order
+                future_returns[:-1] = torch.flip(rev_future_returns, [0])
+            
+            # Compute Q values for each state-action pair (vectorized)
+            # Q value = immediate reward + discounted future return
+            true_q_values = rewards_tensor + gamma_horizon * future_returns
+            
+            # Compute network's Q values using critic
+            with torch.no_grad():
+                # Use target critic to predict Q values for state-action pairs
+                critic_q_values = self._target_critic_approximator.predict(episode_states, episode_actions,
+                                                                             prediction='min', **self._critic_predict_params)
+
+            # Compute errors
+            if critic_q_values.device != true_q_values.device:
+                critic_q_values = critic_q_values.to(true_q_values.device)
+            errors = critic_q_values - true_q_values
+            optimal_critic_errors.extend(errors.cpu().numpy().tolist())
+            optimal_critic_values.extend(critic_q_values.cpu().numpy().tolist())
+        
+        # Loop over sampled offline episodes
+        for ep_idx in sampled_offline_episode_indices:
+            start_idx = offline_episode_starts[ep_idx]
+            end_idx = offline_episode_ends[ep_idx]
+            episode_length = end_idx - start_idx
+            
+            # Extract episode data
+            episode_states = self.offline_dataset.state[start_idx:end_idx]
+            episode_actions = self.offline_dataset.action[start_idx:end_idx]
+            episode_rewards = self.offline_dataset.reward[start_idx:end_idx]
+            
+            # Compute true Q values for each state-action pair
+            # Q(s_i, a_i) = r_i + gamma^horizon * (discounted return from next state forward)
+            # Compute future returns backwards using fully vectorized operations
+            if episode_rewards.dim() > 1:
+                rewards_tensor = episode_rewards.squeeze()
+            else:
+                rewards_tensor = episode_rewards
+            
+            # Shift rewards forward by 1 (rewards[i+1] for future return at i)
+            # Pad with 0 at the end since last state has no future
+            shifted_rewards = torch.cat([rewards_tensor[1:], torch.zeros(1, device=rewards_tensor.device, dtype=rewards_tensor.dtype)])
+            # Compute future returns using fully vectorized backward recurrence
+            # future_returns[i] = shifted_rewards[i] + gamma_horizon * future_returns[i+1]
+            # Use reversed arrays and vectorized cumulative operations
+            future_returns = torch.zeros(episode_length, device=rewards_tensor.device, dtype=torch.float32)
+            if episode_length > 1:
+                # Reverse arrays for forward computation (backward in original order)
+                rev_rewards = torch.flip(shifted_rewards[:-1], [0])
+                n = len(rev_rewards)                
+                # Build discount matrix: for position i, discount from j to i is gamma^(i-j)
+                # Create indices for discount computation
+                i_indices = torch.arange(n, device=rewards_tensor.device, dtype=torch.float32).unsqueeze(1)
+                j_indices = torch.arange(n, device=rewards_tensor.device, dtype=torch.float32).unsqueeze(0)
+                # Create lower triangular discount matrix (only i >= j)
+                discount_matrix = torch.where(
+                    i_indices >= j_indices,
+                    gamma_horizon ** (i_indices - j_indices),
+                    torch.zeros_like(i_indices, dtype=torch.float32)
+                )
+                # Compute future returns: matrix multiplication with discounting
+                # Each row i sums discounted rewards from 0 to i
+                rev_future_returns = torch.sum(discount_matrix * rev_rewards.unsqueeze(0).expand(n, n), dim=1)
+                
+                # Reverse back to original order
+                future_returns[:-1] = torch.flip(rev_future_returns, [0])
+            
+            # Compute Q values for each state-action pair (vectorized)
+            # Q value = immediate reward + discounted future return
+            true_q_values = rewards_tensor + gamma_horizon * future_returns
+            
+            # Compute network's Q values using critic
+            with torch.no_grad():
+                # Use target critic to predict Q values for state-action pairs
+                critic_q_values = self._target_critic_approximator.predict(episode_states, episode_actions,
+                                                                             prediction='min', **self._critic_predict_params)
+            
+            # Compute errors
+            if critic_q_values.device != true_q_values.device:
+                critic_q_values = critic_q_values.to(true_q_values.device)
+            errors = critic_q_values - true_q_values
+            offline_critic_errors.extend(errors.cpu().numpy().tolist())
+            offline_critic_values.extend(critic_q_values.cpu().numpy().tolist())
+        
+        # Convert to numpy arrays for easier computation
+        optimal_critic_errors = np.array(optimal_critic_errors)
+        optimal_critic_values = np.array(optimal_critic_values)
+        offline_critic_errors = np.array(offline_critic_errors)
+        offline_critic_values = np.array(offline_critic_values)
+        
+        # Compute all averages
+        critic_errors_dict = {
+            'optimal_critic_error_mean': np.mean(optimal_critic_errors) if len(optimal_critic_errors) > 0 else 0.0,
+            'optimal_critic_error_std': np.std(optimal_critic_errors) if len(optimal_critic_errors) > 0 else 0.0,
+            'offline_critic_error_mean': np.mean(offline_critic_errors) if len(offline_critic_errors) > 0 else 0.0,
+            'offline_critic_error_std': np.std(offline_critic_errors) if len(offline_critic_errors) > 0 else 0.0,
+            'critic_value_diff_mean': np.mean(optimal_critic_values) - np.mean(offline_critic_values) if len(optimal_critic_values) > 0 and len(offline_critic_values) > 0 else 0.0,
+        }
+        
+        return critic_errors_dict
         
     def _post_load(self):
         self._actor_approximator = self.policy._approximator
