@@ -108,6 +108,7 @@ class IQL_DP(DeepAC):
         self._actor_last_loss = None # Store actor loss for logging
         self._actor_last_bc_loss = None # Store BC loss for logging
         self._actor_last_q_loss = None # Store Q loss for logging
+        self._q_last_loss = None # Store critic Q loss for logging
         self._value_last_loss = None # Store value loss for logging
         self._last_exp_adv = None # Store exp_adv for logging
 
@@ -412,6 +413,7 @@ class IQL_DP(DeepAC):
         
         # Initialize lists to accumulate losses for averaging
         acc_actor_loss = []
+        acc_q_loss = []
         acc_value_loss = []
         acc_exp_adv = []
         acc_actor_bc_loss = []
@@ -443,6 +445,8 @@ class IQL_DP(DeepAC):
                 # Accumulate losses for averaging
                 if self._actor_last_loss is not None:
                     acc_actor_loss.append(self._actor_last_loss)
+                if self._q_last_loss is not None:
+                    acc_q_loss.append(self._q_last_loss)
                 if self._value_last_loss is not None:
                     acc_value_loss.append(self._value_last_loss)
                 if self._last_exp_adv is not None:
@@ -460,6 +464,8 @@ class IQL_DP(DeepAC):
         # Store averaged losses for logging
         if len(acc_actor_loss) > 0:
             self._actor_last_loss = np.mean(acc_actor_loss)
+        if len(acc_q_loss) > 0:
+            self._q_last_loss = np.mean(acc_q_loss)
         if len(acc_value_loss) > 0:
             self._value_last_loss = np.mean(acc_value_loss)
         if len(acc_exp_adv) > 0:
@@ -547,7 +553,13 @@ class IQL_DP(DeepAC):
         q = reward + (~absorbing) * (self.mdp_info.gamma ** self.policy._horizon) * next_v
 
         # Fit critic
-        self._critic_approximator.fit(state, action, q, **self._critic_fit_params)      
+        self._critic_approximator.fit(state, action, q, **self._critic_fit_params)
+        
+        # Store Q loss for logging
+        if hasattr(self._critic_approximator[0], 'loss_fit'):
+            self._q_last_loss = self._critic_approximator[0].loss_fit
+        else:
+            self._q_last_loss = None
 
         # Update target critic
         self._update_target(self._critic_approximator, self._target_critic_approximator)
