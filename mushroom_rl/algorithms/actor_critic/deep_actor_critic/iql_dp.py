@@ -671,16 +671,60 @@ class IQL_DP(DeepAC):
         # Use saved episode boundaries (computed when datasets were loaded)
         optimal_episode_starts = self.optimal_episode_starts
         optimal_episode_ends = self.optimal_episode_ends
-        n_optimal_episodes = len(optimal_episode_starts)
-        n_samples_optimal = max(1, int(n_optimal_episodes * optimal_data_percent))
-        sampled_optimal_episode_indices = np.random.choice(n_optimal_episodes, size=min(n_samples_optimal, n_optimal_episodes), replace=False)
+        
+        # Filter episodes to only include those ending with absorbing=True (vectorized)
+        optimal_end_indices = np.array(optimal_episode_ends)
+        # Get absorbing flags at the end of each episode (end_idx - 1)
+        valid_mask = optimal_end_indices > 0  # Ensure valid indices
+        if valid_mask.any():
+            last_absorbing_indices = optimal_end_indices[valid_mask] - 1
+            absorbing_flags = self.optimal_dataset.absorbing[last_absorbing_indices]
+            # Convert to numpy if tensor, and handle shape
+            if isinstance(absorbing_flags, torch.Tensor):
+                absorbing_flags = absorbing_flags.squeeze().cpu().numpy()
+            else:
+                absorbing_flags = np.array(absorbing_flags).squeeze()
+            # Create mask for episodes with absorbing=True at the end
+            absorbing_mask = np.zeros(len(optimal_episode_ends), dtype=bool)
+            absorbing_mask[valid_mask] = absorbing_flags > 0.5
+            optimal_valid_episode_indices = np.where(absorbing_mask)[0]
+        else:
+            optimal_valid_episode_indices = np.array([], dtype=int)
+        
+        if len(optimal_valid_episode_indices) == 0:
+            raise ValueError('No episodes found with absorbing=True at the end in optimal dataset.')
+        
+        n_samples_optimal = max(1, int(len(optimal_valid_episode_indices) * optimal_data_percent))
+        sampled_optimal_episode_indices = np.random.choice(optimal_valid_episode_indices, size=min(n_samples_optimal, len(optimal_valid_episode_indices)), replace=False)
         
         # Use saved episode boundaries for offline dataset
         offline_episode_starts = self.offline_episode_starts
         offline_episode_ends = self.offline_episode_ends
-        n_offline_episodes = len(offline_episode_starts)
-        n_samples_offline = min(n_samples_optimal, n_offline_episodes)
-        sampled_offline_episode_indices = np.random.choice(n_offline_episodes, size=n_samples_offline, replace=False)
+        
+        # Filter episodes to only include those ending with absorbing=True (vectorized)
+        offline_end_indices = np.array(offline_episode_ends)
+        # Get absorbing flags at the end of each episode (end_idx - 1)
+        valid_mask = offline_end_indices > 0  # Ensure valid indices
+        if valid_mask.any():
+            last_absorbing_indices = offline_end_indices[valid_mask] - 1
+            absorbing_flags = self.offline_dataset.absorbing[last_absorbing_indices]
+            # Convert to numpy if tensor, and handle shape
+            if isinstance(absorbing_flags, torch.Tensor):
+                absorbing_flags = absorbing_flags.squeeze().cpu().numpy()
+            else:
+                absorbing_flags = np.array(absorbing_flags).squeeze()
+            # Create mask for episodes with absorbing=True at the end
+            absorbing_mask = np.zeros(len(offline_episode_ends), dtype=bool)
+            absorbing_mask[valid_mask] = absorbing_flags > 0.5
+            offline_valid_episode_indices = np.where(absorbing_mask)[0]
+        else:
+            offline_valid_episode_indices = np.array([], dtype=int)
+        
+        if len(offline_valid_episode_indices) == 0:
+            raise ValueError('No episodes found with absorbing=True at the end in offline dataset.')
+        
+        n_samples_offline = min(len(sampled_optimal_episode_indices), len(offline_valid_episode_indices))
+        sampled_offline_episode_indices = np.random.choice(offline_valid_episode_indices, size=n_samples_offline, replace=False)
         
         # Initialize lists to accumulate errors
         optimal_critic_errors = []
