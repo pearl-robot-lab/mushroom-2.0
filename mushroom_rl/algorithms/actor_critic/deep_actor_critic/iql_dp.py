@@ -674,6 +674,35 @@ class IQL_DP(DeepAC):
             raise ValueError('States mean and std not computed yet. Call _compute_states_mean_std() on the dataset first.')
         return (states - self._states_mean) / self._states_std
     
+    def _compute_q_values_from_rewards(self, rewards_tensor, absorbing_tensor, gamma):
+        """
+        Compute Q values from rewards and absorbing flags using backward recurrence.
+        
+        Args:
+            rewards_tensor: Tensor of rewards for each state-action pair
+            absorbing_tensor: Tensor of absorbing flags (boolean or 0/1)
+            gamma: Discount factor
+            
+        Returns:
+            Tensor of Q values for each state-action pair
+        """
+        episode_length = len(rewards_tensor)
+        
+        # Convert absorbing to boolean if needed
+        if absorbing_tensor.dtype != torch.bool:
+            absorbing_tensor = absorbing_tensor.bool()
+        
+        # Compute future returns backwards
+        future_returns = torch.zeros(episode_length, device=rewards_tensor.device, dtype=torch.float32)
+        for i in range(episode_length - 2, -1, -1):
+            # Future return is the reward at next step + discounted future return
+            future_returns[i] = rewards_tensor[i + 1] + (~absorbing_tensor[i+1]) * gamma * future_returns[i + 1]
+        
+        # Compute Q values
+        q_values = rewards_tensor + (~absorbing_tensor) * gamma * future_returns
+        
+        return q_values
+    
     def compute_critic_errors(self, optimal_data_percent=0.1):
         """
         Compute critic errors on the optimal dataset.
@@ -752,7 +781,7 @@ class IQL_DP(DeepAC):
         offline_critic_errors = []
         offline_critic_values = []
         
-        gamma_horizon = self.mdp_info.gamma ** self.policy._horizon
+        gamma = self.mdp_info.gamma
         
         # Loop over sampled optimal episodes
         for ep_idx in sampled_optimal_episode_indices:
@@ -764,47 +793,18 @@ class IQL_DP(DeepAC):
             episode_states = self.optimal_dataset.state[start_idx:end_idx]
             episode_actions = self.optimal_dataset.action[start_idx:end_idx]
             episode_rewards = self.optimal_dataset.reward[start_idx:end_idx]
+            episode_absorbing = self.optimal_dataset.absorbing[start_idx:end_idx]
             
             # Compute true Q values for each state-action pair
-            # Q(s_i, a_i) = r_i + gamma^horizon * (discounted return from next state forward)
+            # Q(s_i, a_i) = r_i + gamma * (discounted return from next state forward)
             # Compute future returns backwards using fully vectorized operations
-            if episode_rewards.dim() > 1:
-                rewards_tensor = episode_rewards.squeeze()
-            else:
-                rewards_tensor = episode_rewards
+            rewards_tensor = episode_rewards.squeeze() if episode_rewards.dim() > 1 else episode_rewards
             
-            # Shift rewards forward by 1 (rewards[i+1] for future return at i)
-            # Pad with 0 at the end since last state has no future
-            shifted_rewards = torch.cat([rewards_tensor[1:], torch.zeros(1, device=rewards_tensor.device, dtype=rewards_tensor.dtype)])
-            # Compute future returns using fully vectorized backward recurrence
-            # future_returns[i] = shifted_rewards[i] + gamma_horizon * future_returns[i+1]
-            # Use reversed arrays and vectorized cumulative operations
-            future_returns = torch.zeros(episode_length, device=rewards_tensor.device, dtype=torch.float32)
+            # Extract and process absorbing flags
+            absorbing_tensor = episode_absorbing.squeeze() if episode_absorbing.dim() > 1 else episode_absorbing
             
-            if episode_length > 1:
-                # Reverse arrays for forward computation (backward in original order)
-                rev_rewards = torch.flip(shifted_rewards[:-1], [0])
-                n = len(rev_rewards)
-                # Build discount matrix: for position i, discount from j to i is gamma^(i-j)
-                # Create indices for discount computation
-                i_indices = torch.arange(n, device=rewards_tensor.device, dtype=torch.float32).unsqueeze(1)
-                j_indices = torch.arange(n, device=rewards_tensor.device, dtype=torch.float32).unsqueeze(0)
-                # Create lower triangular discount matrix (only i >= j)
-                discount_matrix = torch.where(
-                    i_indices >= j_indices,
-                    gamma_horizon ** (i_indices - j_indices),
-                    torch.zeros_like(i_indices, dtype=torch.float32)
-                )
-                # Compute future returns: matrix multiplication with discounting
-                # Each row i sums discounted rewards from 0 to i
-                rev_future_returns = torch.sum(discount_matrix * rev_rewards.unsqueeze(0).expand(n, n), dim=1)
-                
-                # Reverse back to original order
-                future_returns[:-1] = torch.flip(rev_future_returns, [0])
-            
-            # Compute Q values for each state-action pair (vectorized)
-            # Q value = immediate reward + discounted future return
-            true_q_values = rewards_tensor + gamma_horizon * future_returns
+            # Compute true Q values using helper function
+            true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma)
             
             # Compute network's Q values using critic
             with torch.no_grad():
@@ -829,46 +829,21 @@ class IQL_DP(DeepAC):
             episode_states = self.offline_dataset.state[start_idx:end_idx]
             episode_actions = self.offline_dataset.action[start_idx:end_idx]
             episode_rewards = self.offline_dataset.reward[start_idx:end_idx]
+            episode_absorbing = self.offline_dataset.absorbing[start_idx:end_idx]
             
             # Compute true Q values for each state-action pair
-            # Q(s_i, a_i) = r_i + gamma^horizon * (discounted return from next state forward)
+            # Q(s_i, a_i) = r_i + gamma * (discounted return from next state forward)
             # Compute future returns backwards using fully vectorized operations
             if episode_rewards.dim() > 1:
                 rewards_tensor = episode_rewards.squeeze()
             else:
                 rewards_tensor = episode_rewards
             
-            # Shift rewards forward by 1 (rewards[i+1] for future return at i)
-            # Pad with 0 at the end since last state has no future
-            shifted_rewards = torch.cat([rewards_tensor[1:], torch.zeros(1, device=rewards_tensor.device, dtype=rewards_tensor.dtype)])
-            # Compute future returns using fully vectorized backward recurrence
-            # future_returns[i] = shifted_rewards[i] + gamma_horizon * future_returns[i+1]
-            # Use reversed arrays and vectorized cumulative operations
-            future_returns = torch.zeros(episode_length, device=rewards_tensor.device, dtype=torch.float32)
-            if episode_length > 1:
-                # Reverse arrays for forward computation (backward in original order)
-                rev_rewards = torch.flip(shifted_rewards[:-1], [0])
-                n = len(rev_rewards)                
-                # Build discount matrix: for position i, discount from j to i is gamma^(i-j)
-                # Create indices for discount computation
-                i_indices = torch.arange(n, device=rewards_tensor.device, dtype=torch.float32).unsqueeze(1)
-                j_indices = torch.arange(n, device=rewards_tensor.device, dtype=torch.float32).unsqueeze(0)
-                # Create lower triangular discount matrix (only i >= j)
-                discount_matrix = torch.where(
-                    i_indices >= j_indices,
-                    gamma_horizon ** (i_indices - j_indices),
-                    torch.zeros_like(i_indices, dtype=torch.float32)
-                )
-                # Compute future returns: matrix multiplication with discounting
-                # Each row i sums discounted rewards from 0 to i
-                rev_future_returns = torch.sum(discount_matrix * rev_rewards.unsqueeze(0).expand(n, n), dim=1)
-                
-                # Reverse back to original order
-                future_returns[:-1] = torch.flip(rev_future_returns, [0])
+            # Extract and process absorbing flags
+            absorbing_tensor = episode_absorbing.squeeze() if episode_absorbing.dim() > 1 else episode_absorbing
             
-            # Compute Q values for each state-action pair (vectorized)
-            # Q value = immediate reward + discounted future return
-            true_q_values = rewards_tensor + gamma_horizon * future_returns
+            # Compute true Q values using helper function
+            true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma)
             
             # Compute network's Q values using critic
             with torch.no_grad():
