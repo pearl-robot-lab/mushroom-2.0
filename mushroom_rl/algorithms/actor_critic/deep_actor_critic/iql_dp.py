@@ -261,7 +261,7 @@ class IQL_DP(DeepAC):
         episode_starts, episode_ends = self._get_episode_boundaries(mushroom_dataset)
         # Limit episodes for debugging
         if debug:
-            max_episodes = 5
+            max_episodes = 500
             episode_starts = episode_starts[:max_episodes]
             episode_ends = episode_ends[:max_episodes]
             print(f"[[Debugging so processing only {len(episode_starts)} episodes]]")
@@ -285,7 +285,7 @@ class IQL_DP(DeepAC):
         # "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4],
         rearranged_dataset = {'obs': torch.empty((0, n_obs_steps, mushroom_dataset.state.shape[1])),
                                 'action': torch.empty((0, action_horizon, mushroom_dataset.action.shape[1])),
-                                'reward': torch.empty((0, mushroom_dataset.reward.shape[1])),
+                                'reward': torch.empty((0, 1)),
                                 'next_obs': torch.empty((0, n_obs_steps, mushroom_dataset.next_state.shape[1])),
                                 'absorbing': torch.empty((0, 1)),
                                 'last': torch.empty((0, 1))
@@ -328,7 +328,7 @@ class IQL_DP(DeepAC):
             last_indices = torch.clip(last_indices, 0, len(episode['last'])-1)
             rearranged_dataset['last'] = torch.cat((rearranged_dataset['last'], episode['last'][last_indices]), dim=0)
             # TODO: make this function faster
-            if debug and idx > 5:
+            if debug and idx > 500:
                 print("[[Debugging so skipping time consuming data rearrangement]]")
                 break
         
@@ -340,6 +340,11 @@ class IQL_DP(DeepAC):
         # rearranged_dataset['absorbing'] = rearranged_dataset['absorbing'].to(TorchUtils.get_device())
         # rearranged_dataset['last'] = rearranged_dataset['last'].to(TorchUtils.get_device())
         
+        # Squeeze rewards, absorbings and last into a single dimension for correct shapes during training
+        rearranged_dataset['reward'] = rearranged_dataset['reward'].squeeze(1)
+        rearranged_dataset['absorbing'] = rearranged_dataset['absorbing'].squeeze(1)
+        rearranged_dataset['last'] = rearranged_dataset['last'].squeeze(1)
+
         # Roll into a single dimension for now.
         # The intermediate dimension will be reintroduced when we batch before sending to DP
         # Flatten the obs and action dimensions: (batch, n_obs_steps, obs_dim) -> (batch, n_obs_steps * obs_dim)

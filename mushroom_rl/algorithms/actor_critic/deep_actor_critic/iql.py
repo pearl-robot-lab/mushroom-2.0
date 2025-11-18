@@ -159,6 +159,9 @@ class IQL(DeepAC):
     def load_dataset(self, datasets, debug=False):
         # there can be more than one dataset so loop over the list
         for dataset in datasets:
+            # if rewards, absorbings and last are not single dimensions, squeeze them
+            for k in ['reward', 'absorbing', 'last']:
+                dataset[k] = dataset[k].squeeze(1) if dataset[k].ndim > 1 else dataset[k]
             # load & create mushroom dataset
             mushroom_dataset = Dataset.from_array(dataset['obs'], dataset['action'], dataset['reward'],
                                                     dataset['next_obs'], dataset['absorbing'], dataset['last'],
