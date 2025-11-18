@@ -108,6 +108,48 @@ class BC_DP(DeepAC):
             _fit_count='primitive',
         )
     
+    def _get_episode_boundaries(self, last_array):
+        """
+        Find episode boundaries in a dataset using the 'last' flag.
+        
+        Args:
+            last_array: Tensor or array with 'last' flags indicating episode ends
+            
+        Returns:
+            tuple: (episode_starts, episode_ends) - lists of start and end indices for each episode
+        """
+        # Convert last to boolean if needed (handle both bool and numeric types)
+        if isinstance(last_array, torch.Tensor):
+            last_array_squeezed = last_array.squeeze() if last_array.dim() > 1 else last_array
+            if last_array_squeezed.dtype != torch.bool:
+                last_array_squeezed = last_array_squeezed.bool()
+            # Find all episode end indices (where last[i] == True)
+            episode_end_indices = torch.where(last_array_squeezed)[0].cpu().numpy()
+        else:
+            last_array_squeezed = last_array.squeeze() if last_array.ndim > 1 else last_array
+            if last_array_squeezed.dtype != bool:
+                last_array_squeezed = last_array_squeezed.astype(bool)
+            # Find all episode end indices (where last[i] == True)
+            episode_end_indices = np.where(last_array_squeezed)[0]
+        
+        # Compute episode start and end indices
+        if len(episode_end_indices) > 0:
+            episode_starts = [0] + (episode_end_indices[:-1] + 1).tolist()
+            episode_ends = (episode_end_indices + 1).tolist()
+            # Handle case where dataset doesn't end with last=True
+            # Include remaining samples as the last episode
+            dataset_length = len(last_array_squeezed)
+            if episode_ends[-1] < dataset_length:
+                episode_starts.append(episode_ends[-1])
+                episode_ends.append(dataset_length)
+        else:
+            # No episode boundaries found - treat entire dataset as one episode
+            dataset_length = len(last_array_squeezed) if isinstance(last_array_squeezed, torch.Tensor) else len(last_array_squeezed)
+            episode_starts = [0]
+            episode_ends = [dataset_length]
+        
+        return episode_starts, episode_ends
+    
     def load_dataset(self, dataset, debug=False):
         # Copy over dataset. Convert to torch tensors
         self.dataset = dict()
@@ -134,44 +176,54 @@ class BC_DP(DeepAC):
         ## rearrange data based on obs_horizon, action_pred_horizon etc. as per diffusion policy
         n_obs_steps = self.policy._n_obs_steps
         action_horizon = self.policy._horizon
-        # rearrange into episodes
+        # Find episode boundaries using the 'last' array
+        episode_starts, episode_ends = self._get_episode_boundaries(self.dataset['last'])
+        # Limit episodes for debugging
+        if debug:
+            max_episodes = 500
+            episode_starts = episode_starts[:max_episodes]
+            episode_ends = episode_ends[:max_episodes]
+            print(f"[[Debugging so processing only {len(episode_starts)} episodes]]")
+        
+        # Create episodes by slicing the original arrays directly
         episodes = []
-        episode = {'obs': torch.empty((0, self.dataset['obs'].shape[1])),
-                   'action': torch.empty((0, self.dataset['action'].shape[1]))}
-        for i in range(len(self.dataset['obs'])):
-            episode['obs'] = torch.vstack((episode['obs'], self.dataset['obs'][i].unsqueeze(0)))
-            episode['action'] = torch.vstack((episode['action'], self.dataset['action'][i].unsqueeze(0)))
-            if self.dataset['last'][i]:
-                episodes.append(episode)
-                episode = {'obs': torch.empty((0, self.dataset['obs'].shape[1])),
-                           'action': torch.empty((0, self.dataset['action'].shape[1]))}
-            if debug and i > 2000:
-                print("[[Debugging so skipping time consuming data rearrangement]]")
-                break
+        for start_idx, end_idx in zip(episode_starts, episode_ends):
+            episode = {
+                'obs': self.dataset['obs'][start_idx:end_idx],
+                'action': self.dataset['action'][start_idx:end_idx]
+            }
+            episodes.append(episode)
         # stack batches of size n_obs_steps for the obs and size horizon for the actions
         # Note: assumption is always that n_obs_steps < action_horizon
         # For example:
         # "observation.state": [-0.1, 0.0],
         # "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4],
-        rearranged_dataset = {'obs': torch.empty((0, n_obs_steps, self.dataset['obs'].shape[1])),
-                              'action': torch.empty((0, action_horizon, self.dataset['action'].shape[1]))}
+        # Use lists to accumulate tensors (O(1) append) instead of repeated torch.cat (O(n²))
+        obs_list = []
+        action_list = []
         for idx, episode in enumerate(episodes):
             # stack obs
             obs_indices = torch.arange(len(episode['obs'])).unsqueeze(1) - torch.arange(n_obs_steps-1, -1, -1)
             # correct for indices out of range. Just pad with the first/last element
             obs_indices = torch.clip(obs_indices, 0, len(episode['obs'])-1)
             obs_stack = episode['obs'][obs_indices]
-            rearranged_dataset['obs'] = torch.cat((rearranged_dataset['obs'], obs_stack), dim=0)
+            obs_list.append(obs_stack)
             # stack actions
             act_indices = torch.arange(len(episode['action'])).unsqueeze(1) - torch.arange(n_obs_steps-1, n_obs_steps-1-action_horizon, -1)
             # correct for indices out of range. Just pad with the first/last element
             act_indices = torch.clip(act_indices, 0, len(episode['action'])-1)
             act_stack = episode['action'][act_indices]
-            rearranged_dataset['action'] = torch.cat((rearranged_dataset['action'], act_stack), dim=0)
+            action_list.append(act_stack)
             # TODO: make this function faster
             if debug and idx > 5:
                 print("[[Debugging so skipping time consuming data rearrangement]]")
                 break
+        
+        # Concatenate all accumulated tensors in a single operation (O(n) instead of O(n²))
+        rearranged_dataset = {
+            'obs': torch.cat(obs_list, dim=0),
+            'action': torch.cat(action_list, dim=0)
+        }
         
         # move devices if needed
         rearranged_dataset['obs'] = rearranged_dataset['obs'].to(TorchUtils.get_device())

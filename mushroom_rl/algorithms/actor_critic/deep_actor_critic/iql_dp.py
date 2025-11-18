@@ -283,13 +283,17 @@ class IQL_DP(DeepAC):
         # For example:
         # "observation.state": [-0.1, 0.0],
         # "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4],
-        rearranged_dataset = {'obs': torch.empty((0, n_obs_steps, mushroom_dataset.state.shape[1])),
-                                'action': torch.empty((0, action_horizon, mushroom_dataset.action.shape[1])),
-                                'reward': torch.empty((0, 1)),
-                                'next_obs': torch.empty((0, n_obs_steps, mushroom_dataset.next_state.shape[1])),
-                                'absorbing': torch.empty((0, 1)),
-                                'last': torch.empty((0, 1))
-                                }
+        # Use lists to accumulate tensors
+        obs_list = []
+        next_obs_list = []
+        action_list = []
+        reward_list = []
+        absorbing_list = []
+        last_list = []
+        
+        # Pre-compute discount powers (constant across all episodes)
+        discount_powers = (self.mdp_info.gamma ** torch.arange(action_horizon)).unsqueeze(0)
+        
         for idx, episode in enumerate(episodes):
             # stack obs
             # compute obs indices
@@ -301,37 +305,53 @@ class IQL_DP(DeepAC):
             next_obs_indices = torch.clip(next_obs_indices, 0, len(episode['next_obs'])-1)
             obs_stack = episode['obs'][obs_indices]
             next_obs_stack = episode['next_obs'][next_obs_indices]
-            rearranged_dataset['obs'] = torch.cat((rearranged_dataset['obs'], obs_stack), dim=0)
-            rearranged_dataset['next_obs'] = torch.cat((rearranged_dataset['next_obs'], next_obs_stack), dim=0)
+            obs_list.append(obs_stack)
+            next_obs_list.append(next_obs_stack)
             # stack actions
             act_indices = torch.arange(len(episode['action'])).unsqueeze(1) - torch.arange(n_obs_steps-1, n_obs_steps-1-action_horizon, -1)
             # correct for indices out of range. Just pad with the first/last element
             act_indices = torch.clip(act_indices, 0, len(episode['action'])-1)
             act_stack = episode['action'][act_indices]
-            rearranged_dataset['action'] = torch.cat((rearranged_dataset['action'], act_stack), dim=0)
+            action_list.append(act_stack)
             # accumulate rewards for the action chunk, zero rewards for out of range indices
             reward_indices = torch.arange(len(episode['reward'])).unsqueeze(1) - torch.arange(n_obs_steps-1, n_obs_steps-1-action_horizon, -1)
             episode_reward_array = torch.cat((episode['reward'], torch.zeros((1,1))), dim=0) # add zero reward at end for out of range indices
             out_of_range = (reward_indices < 0) | (reward_indices >= len(episode['reward']))
             reward_indices[out_of_range] = len(episode['reward']) # new end index will have a zero reward value
-            discount_powers = self.mdp_info.gamma ** torch.arange(action_horizon).unsqueeze(0)
             discounted_rewards = episode_reward_array[reward_indices] * discount_powers.T
             acc_rewards = torch.sum(discounted_rewards, dim=1)
-            rearranged_dataset['reward'] = torch.cat((rearranged_dataset['reward'], acc_rewards), dim=0)
+            reward_list.append(acc_rewards)
             # rearrange last and absorbing: move them forward the same amount as we moved the next_obs since they are in sync
             absorbing_indices = torch.arange(len(episode['absorbing']))
             absorbing_indices = absorbing_indices + action_horizon - n_obs_steps
             absorbing_indices = torch.clip(absorbing_indices, 0, len(episode['absorbing'])-1)
-            rearranged_dataset['absorbing'] = torch.cat((rearranged_dataset['absorbing'], episode['absorbing'][absorbing_indices]), dim=0)
+            episode_absorbing_array = episode['absorbing'][absorbing_indices]
+            absorbing_list.append(episode_absorbing_array)
             last_indices = torch.arange(len(episode['last']))
             last_indices = last_indices + action_horizon - n_obs_steps
             last_indices = torch.clip(last_indices, 0, len(episode['last'])-1)
-            rearranged_dataset['last'] = torch.cat((rearranged_dataset['last'], episode['last'][last_indices]), dim=0)
+            episode_last_array = episode['last'][last_indices]
+            last_list.append(episode_last_array)
             # TODO: make this function faster
             if debug and idx > 500:
                 print("[[Debugging so skipping time consuming data rearrangement]]")
                 break
         
+        # Concatenate all accumulated tensors
+        rearranged_dataset = {
+            'obs': torch.cat(obs_list, dim=0),
+            'next_obs': torch.cat(next_obs_list, dim=0),
+            'action': torch.cat(action_list, dim=0),
+            'reward': torch.cat(reward_list, dim=0),
+            'absorbing': torch.cat(absorbing_list, dim=0),
+            'last': torch.cat(last_list, dim=0)
+        }
+        
+        # Squeeze rewards, absorbings and last into a single dimension for correct shapes during training
+        rearranged_dataset['reward'] = rearranged_dataset['reward'].squeeze(1)
+        rearranged_dataset['absorbing'] = rearranged_dataset['absorbing'].squeeze(1)
+        rearranged_dataset['last'] = rearranged_dataset['last'].squeeze(1)
+
         # move devices if needed
         # rearranged_dataset['obs'] = rearranged_dataset['obs'].to(TorchUtils.get_device())
         # rearranged_dataset['action'] = rearranged_dataset['action'].to(TorchUtils.get_device())
@@ -339,11 +359,6 @@ class IQL_DP(DeepAC):
         # rearranged_dataset['next_obs'] = rearranged_dataset['next_obs'].to(TorchUtils.get_device())
         # rearranged_dataset['absorbing'] = rearranged_dataset['absorbing'].to(TorchUtils.get_device())
         # rearranged_dataset['last'] = rearranged_dataset['last'].to(TorchUtils.get_device())
-        
-        # Squeeze rewards, absorbings and last into a single dimension for correct shapes during training
-        rearranged_dataset['reward'] = rearranged_dataset['reward'].squeeze(1)
-        rearranged_dataset['absorbing'] = rearranged_dataset['absorbing'].squeeze(1)
-        rearranged_dataset['last'] = rearranged_dataset['last'].squeeze(1)
 
         # Roll into a single dimension for now.
         # The intermediate dimension will be reintroduced when we batch before sending to DP
