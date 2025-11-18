@@ -674,14 +674,15 @@ class IQL_DP(DeepAC):
             raise ValueError('States mean and std not computed yet. Call _compute_states_mean_std() on the dataset first.')
         return (states - self._states_mean) / self._states_std
     
-    def _compute_q_values_from_rewards(self, rewards_tensor, absorbing_tensor, gamma):
+    def _compute_q_values_from_rewards(self, rewards_tensor, absorbing_tensor, gamma_horizon, shift=1):
         """
         Compute Q values from rewards and absorbing flags using backward recurrence.
         
         Args:
             rewards_tensor: Tensor of rewards for each state-action pair
             absorbing_tensor: Tensor of absorbing flags (boolean or 0/1)
-            gamma: Discount factor
+            gamma_horizon: Discount factor raised to horizon power
+            shift: Number of steps to shift forward (horizon - n_obs_steps for chunked data)
             
         Returns:
             Tensor of Q values for each state-action pair
@@ -694,12 +695,14 @@ class IQL_DP(DeepAC):
         
         # Compute future returns backwards
         future_returns = torch.zeros(episode_length, device=rewards_tensor.device, dtype=torch.float32)
-        for i in range(episode_length - 2, -1, -1):
-            # Future return is the reward at next step + discounted future return
-            future_returns[i] = rewards_tensor[i + 1] + (~absorbing_tensor[i+1]) * gamma * future_returns[i + 1]
+        for i in range(episode_length - shift - 1, -1, -1):
+            next_idx = i + shift
+            if next_idx < episode_length:
+                # Future return is the reward at next chunk + discounted future return
+                future_returns[i-1] = rewards_tensor[next_idx] + (~absorbing_tensor[next_idx]) * gamma_horizon * future_returns[next_idx]
         
         # Compute Q values
-        q_values = rewards_tensor + (~absorbing_tensor) * gamma * future_returns
+        q_values = rewards_tensor + (~absorbing_tensor) * gamma_horizon * future_returns
         
         return q_values
     
@@ -781,7 +784,8 @@ class IQL_DP(DeepAC):
         offline_critic_errors = []
         offline_critic_values = []
         
-        gamma = self.mdp_info.gamma
+        gamma_horizon = self.mdp_info.gamma ** self.policy._horizon
+        shift = self.policy._horizon - self.policy._n_obs_steps
         
         # Loop over sampled optimal episodes
         for ep_idx in sampled_optimal_episode_indices:
@@ -796,7 +800,7 @@ class IQL_DP(DeepAC):
             episode_absorbing = self.optimal_dataset.absorbing[start_idx:end_idx]
             
             # Compute true Q values for each state-action pair
-            # Q(s_i, a_i) = r_i + gamma * (discounted return from next state forward)
+            # Q(s_i, a_i) = r_i + gamma^horizon * (discounted return from next chunk forward)
             # Compute future returns backwards using fully vectorized operations
             rewards_tensor = episode_rewards.squeeze() if episode_rewards.dim() > 1 else episode_rewards
             
@@ -804,7 +808,7 @@ class IQL_DP(DeepAC):
             absorbing_tensor = episode_absorbing.squeeze() if episode_absorbing.dim() > 1 else episode_absorbing
             
             # Compute true Q values using helper function
-            true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma)
+            true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma_horizon, shift)
             
             # Compute network's Q values using critic
             with torch.no_grad():
@@ -832,7 +836,7 @@ class IQL_DP(DeepAC):
             episode_absorbing = self.offline_dataset.absorbing[start_idx:end_idx]
             
             # Compute true Q values for each state-action pair
-            # Q(s_i, a_i) = r_i + gamma * (discounted return from next state forward)
+            # Q(s_i, a_i) = r_i + gamma^horizon * (discounted return from next chunk forward)
             # Compute future returns backwards using fully vectorized operations
             if episode_rewards.dim() > 1:
                 rewards_tensor = episode_rewards.squeeze()
@@ -843,7 +847,7 @@ class IQL_DP(DeepAC):
             absorbing_tensor = episode_absorbing.squeeze() if episode_absorbing.dim() > 1 else episode_absorbing
             
             # Compute true Q values using helper function
-            true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma)
+            true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma_horizon, shift)
             
             # Compute network's Q values using critic
             with torch.no_grad():
