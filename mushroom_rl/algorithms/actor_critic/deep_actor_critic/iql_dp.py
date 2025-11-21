@@ -742,6 +742,88 @@ class IQL_DP(DeepAC):
         
         return q_values
     
+    def _get_valid_episode_indices(self, dataset, episode_starts, episode_ends, dataset_name):
+        """
+        Filter episodes to only include those ending with absorbing=True.
+        
+        Args:
+            dataset: Dataset object
+            episode_starts: List of episode start indices
+            episode_ends: List of episode end indices
+            dataset_name: Name of dataset for error messages
+        
+        Returns:
+            numpy array of valid episode indices
+        """
+        end_indices = np.array(episode_ends)
+        valid_mask = end_indices > 0
+        if valid_mask.any():
+            last_absorbing_indices = end_indices[valid_mask] - 1
+            absorbing_flags = dataset.absorbing[last_absorbing_indices]
+            if isinstance(absorbing_flags, torch.Tensor):
+                absorbing_flags = absorbing_flags.squeeze().cpu().numpy()
+            else:
+                absorbing_flags = np.array(absorbing_flags).squeeze()
+            absorbing_mask = np.zeros(len(episode_ends), dtype=bool)
+            absorbing_mask[valid_mask] = absorbing_flags > 0.5
+            valid_episode_indices = np.where(absorbing_mask)[0]
+        else:
+            valid_episode_indices = np.array([], dtype=int)
+        
+        if len(valid_episode_indices) == 0:
+            raise ValueError(f'No episodes found with absorbing=True at the end in {dataset_name} dataset.')
+        
+        return valid_episode_indices
+    
+    def _compute_critic_errors_for_episodes(self, dataset, episode_starts, episode_ends, sampled_indices, gamma_horizon, shift):
+        """
+        Compute critic errors for a set of sampled episodes.
+        
+        Args:
+            dataset: Dataset object
+            episode_starts: List of episode start indices
+            episode_ends: List of episode end indices
+            sampled_indices: Array of episode indices to process
+            gamma_horizon: Discount factor raised to horizon power
+            shift: Number of steps to shift forward
+        
+        Returns:
+            tuple: (errors_list, values_list) - lists of errors and values
+        """
+        errors_list = []
+        values_list = []
+        
+        for ep_idx in sampled_indices:
+            start_idx = episode_starts[ep_idx]
+            end_idx = episode_ends[ep_idx]
+            
+            # Extract episode data
+            episode_states = dataset.state[start_idx:end_idx]
+            episode_actions = dataset.action[start_idx:end_idx]
+            episode_rewards = dataset.reward[start_idx:end_idx]
+            episode_absorbing = dataset.absorbing[start_idx:end_idx]
+            
+            # Process rewards and absorbing flags
+            rewards_tensor = episode_rewards.squeeze() if (hasattr(episode_rewards, 'dim') and episode_rewards.dim() > 1) else episode_rewards
+            absorbing_tensor = episode_absorbing.squeeze() if (hasattr(episode_absorbing, 'dim') and episode_absorbing.dim() > 1) else episode_absorbing
+            
+            # Compute true Q values
+            true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma_horizon, shift)
+            
+            # Compute network's Q values using critic
+            with torch.no_grad():
+                critic_q_values = self._target_critic_approximator.predict(
+                    episode_states, episode_actions, prediction='min', **self._critic_predict_params)
+            
+            # Compute errors
+            if critic_q_values.device != true_q_values.device:
+                critic_q_values = critic_q_values.to(true_q_values.device)
+            errors = critic_q_values - true_q_values
+            errors_list.extend(errors.cpu().numpy().tolist())
+            values_list.extend(critic_q_values.cpu().numpy().tolist())
+        
+        return errors_list, values_list
+    
     def compute_critic_errors(self, optimal_data_percent=0.1):
         """
         Compute critic errors on the optimal, offline, and actor datasets.
@@ -756,236 +838,67 @@ class IQL_DP(DeepAC):
         if self.offline_dataset is None:
             raise ValueError('No offline dataset loaded!. Call load_dataset() first.')
 
-        # Use saved episode boundaries (computed when datasets were loaded)
-        optimal_episode_starts = self.optimal_episode_starts
-        optimal_episode_ends = self.optimal_episode_ends
+        # Get valid episode indices for each dataset
+        optimal_valid_indices = self._get_valid_episode_indices(
+            self.optimal_dataset, self.optimal_episode_starts, self.optimal_episode_ends, 'optimal')
+        offline_valid_indices = self._get_valid_episode_indices(
+            self.offline_dataset, self.offline_episode_starts, self.offline_episode_ends, 'offline')
         
-        # Filter episodes to only include those ending with absorbing=True (vectorized)
-        optimal_end_indices = np.array(optimal_episode_ends)
-        # Get absorbing flags at the end of each episode (end_idx - 1)
-        valid_mask = optimal_end_indices > 0  # Ensure valid indices
-        if valid_mask.any():
-            last_absorbing_indices = optimal_end_indices[valid_mask] - 1
-            absorbing_flags = self.optimal_dataset.absorbing[last_absorbing_indices]
-            # Convert to numpy if tensor, and handle shape
-            if isinstance(absorbing_flags, torch.Tensor):
-                absorbing_flags = absorbing_flags.squeeze().cpu().numpy()
-            else:
-                absorbing_flags = np.array(absorbing_flags).squeeze()
-            # Create mask for episodes with absorbing=True at the end
-            absorbing_mask = np.zeros(len(optimal_episode_ends), dtype=bool)
-            absorbing_mask[valid_mask] = absorbing_flags > 0.5
-            optimal_valid_episode_indices = np.where(absorbing_mask)[0]
-        else:
-            optimal_valid_episode_indices = np.array([], dtype=int)
+        # Sample episodes
+        n_samples_optimal = max(1, int(len(optimal_valid_indices) * optimal_data_percent))
+        sampled_optimal_indices = np.random.choice(
+            optimal_valid_indices, size=min(n_samples_optimal, len(optimal_valid_indices)), replace=False)
+        n_samples_offline = min(len(sampled_optimal_indices), len(offline_valid_indices))
+        sampled_offline_indices = np.random.choice(offline_valid_indices, size=n_samples_offline, replace=False)
         
-        if len(optimal_valid_episode_indices) == 0:
-            raise ValueError('No episodes found with absorbing=True at the end in optimal dataset.')
-        
-        n_samples_optimal = max(1, int(len(optimal_valid_episode_indices) * optimal_data_percent))
-        sampled_optimal_episode_indices = np.random.choice(optimal_valid_episode_indices, size=min(n_samples_optimal, len(optimal_valid_episode_indices)), replace=False)
-        
-        # Use saved episode boundaries for offline dataset
-        offline_episode_starts = self.offline_episode_starts
-        offline_episode_ends = self.offline_episode_ends
-        
-        # Filter episodes to only include those ending with absorbing=True (vectorized)
-        offline_end_indices = np.array(offline_episode_ends)
-        # Get absorbing flags at the end of each episode (end_idx - 1)
-        valid_mask = offline_end_indices > 0  # Ensure valid indices
-        if valid_mask.any():
-            last_absorbing_indices = offline_end_indices[valid_mask] - 1
-            absorbing_flags = self.offline_dataset.absorbing[last_absorbing_indices]
-            # Convert to numpy if tensor, and handle shape
-            if isinstance(absorbing_flags, torch.Tensor):
-                absorbing_flags = absorbing_flags.squeeze().cpu().numpy()
-            else:
-                absorbing_flags = np.array(absorbing_flags).squeeze()
-            # Create mask for episodes with absorbing=True at the end
-            absorbing_mask = np.zeros(len(offline_episode_ends), dtype=bool)
-            absorbing_mask[valid_mask] = absorbing_flags > 0.5
-            offline_valid_episode_indices = np.where(absorbing_mask)[0]
-        else:
-            offline_valid_episode_indices = np.array([], dtype=int)
-        
-        if len(offline_valid_episode_indices) == 0:
-            raise ValueError('No episodes found with absorbing=True at the end in offline dataset.')
-        
-        n_samples_offline = min(len(sampled_optimal_episode_indices), len(offline_valid_episode_indices))
-        sampled_offline_episode_indices = np.random.choice(offline_valid_episode_indices, size=n_samples_offline, replace=False)
-        
-        # Initialize lists to accumulate errors
-        optimal_critic_errors = []
-        optimal_critic_values = []
-        offline_critic_errors = []
-        offline_critic_values = []
-        actor_critic_errors = []
-        actor_critic_values = []
-        
+        # Compute critic errors
         gamma_horizon = self.mdp_info.gamma ** self.policy._horizon
         shift = self.policy._horizon - self.policy._n_obs_steps
         
-        # Loop over sampled optimal episodes
-        for ep_idx in sampled_optimal_episode_indices:
-            start_idx = optimal_episode_starts[ep_idx]
-            end_idx = optimal_episode_ends[ep_idx]
-            episode_length = end_idx - start_idx
-            
-            # Extract episode data
-            episode_states = self.optimal_dataset.state[start_idx:end_idx]
-            episode_actions = self.optimal_dataset.action[start_idx:end_idx]
-            episode_rewards = self.optimal_dataset.reward[start_idx:end_idx]
-            episode_absorbing = self.optimal_dataset.absorbing[start_idx:end_idx]
-            
-            # Compute true Q values for each state-action pair
-            # Q(s_i, a_i) = r_i + gamma^horizon * (discounted return from next chunk forward)
-            # Compute future returns backwards using fully vectorized operations
-            rewards_tensor = episode_rewards.squeeze() if episode_rewards.dim() > 1 else episode_rewards
-            
-            # Extract and process absorbing flags
-            absorbing_tensor = episode_absorbing.squeeze() if episode_absorbing.dim() > 1 else episode_absorbing
-            
-            # Compute true Q values using helper function
-            true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma_horizon, shift)
-            
-            # Compute network's Q values using critic
-            with torch.no_grad():
-                # Use target critic to predict Q values for state-action pairs
-                critic_q_values = self._target_critic_approximator.predict(episode_states, episode_actions,
-                                                                             prediction='min', **self._critic_predict_params)
-
-            # Compute errors
-            if critic_q_values.device != true_q_values.device:
-                critic_q_values = critic_q_values.to(true_q_values.device)
-            errors = critic_q_values - true_q_values
-            optimal_critic_errors.extend(errors.cpu().numpy().tolist())
-            optimal_critic_values.extend(critic_q_values.cpu().numpy().tolist())
-        
-        # Loop over sampled offline episodes
-        for ep_idx in sampled_offline_episode_indices:
-            start_idx = offline_episode_starts[ep_idx]
-            end_idx = offline_episode_ends[ep_idx]
-            episode_length = end_idx - start_idx
-            
-            # Extract episode data
-            episode_states = self.offline_dataset.state[start_idx:end_idx]
-            episode_actions = self.offline_dataset.action[start_idx:end_idx]
-            episode_rewards = self.offline_dataset.reward[start_idx:end_idx]
-            episode_absorbing = self.offline_dataset.absorbing[start_idx:end_idx]
-            
-            # Compute true Q values for each state-action pair
-            # Q(s_i, a_i) = r_i + gamma^horizon * (discounted return from next chunk forward)
-            # Compute future returns backwards using fully vectorized operations
-            if episode_rewards.dim() > 1:
-                rewards_tensor = episode_rewards.squeeze()
-            else:
-                rewards_tensor = episode_rewards
-            
-            # Extract and process absorbing flags
-            absorbing_tensor = episode_absorbing.squeeze() if episode_absorbing.dim() > 1 else episode_absorbing
-            
-            # Compute true Q values using helper function
-            true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma_horizon, shift)
-            
-            # Compute network's Q values using critic
-            with torch.no_grad():
-                # Use target critic to predict Q values for state-action pairs
-                critic_q_values = self._target_critic_approximator.predict(episode_states, episode_actions,
-                                                                             prediction='min', **self._critic_predict_params)
-            
-            # Compute errors
-            if critic_q_values.device != true_q_values.device:
-                critic_q_values = critic_q_values.to(true_q_values.device)
-            errors = critic_q_values - true_q_values
-            offline_critic_errors.extend(errors.cpu().numpy().tolist())
-            offline_critic_values.extend(critic_q_values.cpu().numpy().tolist())
+        optimal_errors, optimal_values = self._compute_critic_errors_for_episodes(
+            self.optimal_dataset, self.optimal_episode_starts, self.optimal_episode_ends,
+            sampled_optimal_indices, gamma_horizon, shift)
+        offline_errors, offline_values = self._compute_critic_errors_for_episodes(
+            self.offline_dataset, self.offline_episode_starts, self.offline_episode_ends,
+            sampled_offline_indices, gamma_horizon, shift)
         
         # Process actor dataset if available
+        actor_errors, actor_values = [], []
         if self.actor_dataset is not None:
-            # Use saved episode boundaries for actor dataset
-            actor_episode_starts = self.actor_episode_starts
-            actor_episode_ends = self.actor_episode_ends
-            
-            # Filter episodes to only include those ending with absorbing=True (vectorized)
-            actor_end_indices = np.array(actor_episode_ends)
-            # Get absorbing flags at the end of each episode (end_idx - 1)
-            valid_mask = actor_end_indices > 0  # Ensure valid indices
-            if valid_mask.any():
-                last_absorbing_indices = actor_end_indices[valid_mask] - 1
-                absorbing_flags = self.actor_dataset.absorbing[last_absorbing_indices]
-                # Convert to numpy if tensor, and handle shape
-                if isinstance(absorbing_flags, torch.Tensor):
-                    absorbing_flags = absorbing_flags.squeeze().cpu().numpy()
-                else:
-                    absorbing_flags = np.array(absorbing_flags).squeeze()
-                # Create mask for episodes with absorbing=True at the end
-                absorbing_mask = np.zeros(len(actor_episode_ends), dtype=bool)
-                absorbing_mask[valid_mask] = absorbing_flags > 0.5
-                actor_valid_episode_indices = np.where(absorbing_mask)[0]
+            actor_valid_indices = self._get_valid_episode_indices(
+                self.actor_dataset, self.actor_episode_starts, self.actor_episode_ends, 'actor')
+            if len(actor_valid_indices) > 0:
+                n_samples_actor = min(len(sampled_optimal_indices), len(actor_valid_indices))
+                sampled_actor_indices = np.random.choice(actor_valid_indices, size=n_samples_actor, replace=False)
+                actor_errors, actor_values = self._compute_critic_errors_for_episodes(
+                    self.actor_dataset, self.actor_episode_starts, self.actor_episode_ends,
+                    sampled_actor_indices, gamma_horizon, shift)
             else:
-                actor_valid_episode_indices = np.array([], dtype=int)
-            
-            if len(actor_valid_episode_indices) > 0:
-                n_samples_actor = min(len(sampled_optimal_episode_indices), len(actor_valid_episode_indices))
-                sampled_actor_episode_indices = np.random.choice(actor_valid_episode_indices, size=n_samples_actor, replace=False)
-                
-                # Loop over sampled actor episodes
-                for ep_idx in sampled_actor_episode_indices:
-                    start_idx = actor_episode_starts[ep_idx]
-                    end_idx = actor_episode_ends[ep_idx]
-                    episode_length = end_idx - start_idx
-                    
-                    # Extract episode data
-                    episode_states = self.actor_dataset.state[start_idx:end_idx]
-                    episode_actions = self.actor_dataset.action[start_idx:end_idx]
-                    episode_rewards = self.actor_dataset.reward[start_idx:end_idx]
-                    episode_absorbing = self.actor_dataset.absorbing[start_idx:end_idx]
-                    
-                    # Compute true Q values for each state-action pair
-                    rewards_tensor = episode_rewards.squeeze() if episode_rewards.dim() > 1 else episode_rewards
-                    
-                    # Extract and process absorbing flags
-                    absorbing_tensor = episode_absorbing.squeeze() if episode_absorbing.dim() > 1 else episode_absorbing
-                    
-                    # Compute true Q values using helper function
-                    true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma_horizon, shift)
-                    
-                    # Compute network's Q values using critic
-                    with torch.no_grad():
-                        # Use target critic to predict Q values for state-action pairs
-                        critic_q_values = self._target_critic_approximator.predict(episode_states, episode_actions,
-                                                                                     prediction='min', **self._critic_predict_params)
-                    
-                    # Compute errors
-                    if critic_q_values.device != true_q_values.device:
-                        critic_q_values = critic_q_values.to(true_q_values.device)
-                    errors = critic_q_values - true_q_values
-                    actor_critic_errors.extend(errors.cpu().numpy().tolist())
-                    actor_critic_values.extend(critic_q_values.cpu().numpy().tolist())
+                print(f'No actor episodes found with absorbing=True at the end in actor dataset.')
         
-        # Convert to numpy arrays for easier computation
-        optimal_critic_errors = np.array(optimal_critic_errors)
-        optimal_critic_values = np.array(optimal_critic_values)
-        offline_critic_errors = np.array(offline_critic_errors)
-        offline_critic_values = np.array(offline_critic_values)
-        actor_critic_errors = np.array(actor_critic_errors) if len(actor_critic_errors) > 0 else np.array([])
-        actor_critic_values = np.array(actor_critic_values) if len(actor_critic_values) > 0 else np.array([])
+        # Convert to numpy arrays and compute statistics
+        optimal_errors = np.array(optimal_errors)
+        optimal_values = np.array(optimal_values)
+        offline_errors = np.array(offline_errors)
+        offline_values = np.array(offline_values)
+        actor_errors = np.array(actor_errors) if len(actor_errors) > 0 else np.array([])
+        actor_values = np.array(actor_values) if len(actor_values) > 0 else np.array([])
         
-        # Compute all averages
+        # Build results dictionary
         critic_errors_dict = {
-            'optimal_critic_error_mean': np.mean(optimal_critic_errors) if len(optimal_critic_errors) > 0 else 0.0,
-            'optimal_critic_error_std': np.std(optimal_critic_errors) if len(optimal_critic_errors) > 0 else 0.0,
-            'offline_critic_error_mean': np.mean(offline_critic_errors) if len(offline_critic_errors) > 0 else 0.0,
-            'offline_critic_error_std': np.std(offline_critic_errors) if len(offline_critic_errors) > 0 else 0.0,
-            'critic_value_diff_mean': np.mean(optimal_critic_values) - np.mean(offline_critic_values) if len(optimal_critic_values) > 0 and len(offline_critic_values) > 0 else 0.0,
+            'optimal_critic_error_mean': np.mean(optimal_errors) if len(optimal_errors) > 0 else 0.0,
+            'optimal_critic_error_std': np.std(optimal_errors) if len(optimal_errors) > 0 else 0.0,
+            'offline_critic_error_mean': np.mean(offline_errors) if len(offline_errors) > 0 else 0.0,
+            'offline_critic_error_std': np.std(offline_errors) if len(offline_errors) > 0 else 0.0,
+            'optimal_minus_offline_value_mean': np.mean(optimal_values) - np.mean(offline_values) if len(optimal_values) > 0 and len(offline_values) > 0 else 0.0,
         }
         
-        # Add actor dataset metrics if available
-        if len(actor_critic_errors) > 0:
-            critic_errors_dict['actor_critic_error_mean'] = np.mean(actor_critic_errors)
-            critic_errors_dict['actor_critic_error_std'] = np.std(actor_critic_errors)
-            if len(actor_critic_values) > 0:
-                critic_errors_dict['actor_critic_value_mean'] = np.mean(actor_critic_values)
+        if len(actor_errors) > 0:
+            critic_errors_dict['actor_critic_error_mean'] = np.mean(actor_errors)
+            critic_errors_dict['actor_critic_error_std'] = np.std(actor_errors)
+            if len(actor_values) > 0:
+                critic_errors_dict['optimal_minus_actor_value_mean'] = np.mean(optimal_values) - np.mean(actor_values) if len(optimal_values) > 0 and len(actor_values) > 0 else 0.0,
+                critic_errors_dict['offline_minus_actor_value_mean'] = np.mean(offline_values) - np.mean(actor_values) if len(offline_values) > 0 and len(actor_values) > 0 else 0.0,
         
         return critic_errors_dict
         
