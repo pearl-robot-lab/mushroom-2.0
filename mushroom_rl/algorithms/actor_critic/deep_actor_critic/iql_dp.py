@@ -884,6 +884,29 @@ class IQL_DP(DeepAC):
         actor_errors = np.array(actor_errors) if len(actor_errors) > 0 else np.array([])
         actor_values = np.array(actor_values) if len(actor_values) > 0 else np.array([])
         
+        # Resample to ensure equal number of values from each dataset
+        if len(optimal_values) > 0 and len(offline_values) > 0:
+            if len(actor_values) > 0:
+                # Find minimum length among all three
+                min_length = min(len(optimal_values), len(offline_values), len(actor_values))
+            else:
+                # Find minimum length between optimal and offline
+                min_length = min(len(optimal_values), len(offline_values))
+            
+            # Resample all arrays to have equal length
+            if len(optimal_values) > min_length:
+                indices = np.random.choice(len(optimal_values), size=min_length, replace=False)
+                optimal_errors = optimal_errors[indices]
+                optimal_values = optimal_values[indices]
+            if len(offline_values) > min_length:
+                indices = np.random.choice(len(offline_values), size=min_length, replace=False)
+                offline_errors = offline_errors[indices]
+                offline_values = offline_values[indices]
+            if len(actor_values) > 0 and len(actor_values) > min_length:
+                indices = np.random.choice(len(actor_values), size=min_length, replace=False)
+                actor_errors = actor_errors[indices]
+                actor_values = actor_values[indices]
+        
         # Build results dictionary
         critic_errors_dict = {
             'optimal_critic_error_mean': np.mean(optimal_errors) if len(optimal_errors) > 0 else 0.0,
@@ -896,9 +919,8 @@ class IQL_DP(DeepAC):
         if len(actor_errors) > 0:
             critic_errors_dict['actor_critic_error_mean'] = np.mean(actor_errors)
             critic_errors_dict['actor_critic_error_std'] = np.std(actor_errors)
-            if len(actor_values) > 0:
-                critic_errors_dict['optimal_minus_actor_value_mean'] = np.mean(optimal_values) - np.mean(actor_values) if len(optimal_values) > 0 and len(actor_values) > 0 else 0.0,
-                critic_errors_dict['offline_minus_actor_value_mean'] = np.mean(offline_values) - np.mean(actor_values) if len(offline_values) > 0 and len(actor_values) > 0 else 0.0,
+            critic_errors_dict['optimal_minus_actor_value_mean'] = np.mean(optimal_values) - np.mean(actor_values)
+            critic_errors_dict['offline_minus_actor_value_mean'] = np.mean(offline_values) - np.mean(actor_values)
         
         return critic_errors_dict
         
