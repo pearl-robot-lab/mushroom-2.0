@@ -147,10 +147,13 @@ class IQL_DP(DeepAC):
         
         self.offline_dataset = None
         self.optimal_dataset = None  # Store optimal dataset for critic error computation
+        self.actor_dataset = None  # Store actor dataset for actor training and critic error computation
         self.offline_episode_starts = None  # Episode boundaries for offline dataset
         self.offline_episode_ends = None
         self.optimal_episode_starts = None  # Episode boundaries for optimal dataset
         self.optimal_episode_ends = None
+        self.actor_episode_starts = None  # Episode boundaries for actor dataset
+        self.actor_episode_ends = None
 
         self._add_save_attr(
             _critic_fit_params='pickle',
@@ -427,9 +430,42 @@ class IQL_DP(DeepAC):
         self.optimal_episode_starts = optimal_episode_starts
         self.optimal_episode_ends = optimal_episode_ends
     
+    def load_actor_dataset(self, datasets, compute_mean_std=True, debug=False):
+        """
+        Load actor dataset for actor training and critic error computation.
+        Similar to load_optimal_dataset but stores the actor dataset separately.
+        
+        Args:
+            datasets: list of dictionaries with keys: obs, action, reward, next_obs, absorbing, last
+            compute_mean_std: whether to compute mean/std for normalization (uses same normalization as offline dataset)
+            debug: if True, skip time-consuming data rearrangement for debugging
+        """
+        # Check that mean/std are already computed if normalize_states is True
+        if self._normalize_states and compute_mean_std:
+            if self._states_mean is None or self._states_std is None:
+                raise ValueError('States mean and std not computed yet. Call load_dataset() first.')
+        
+        # Load and chunk the dataset using the shared helper function
+        # Pass compute_mean_std=False since we should use existing normalization
+        chunked_actor_dataset, actor_episode_starts, actor_episode_ends = self._load_and_chunk_dataset(datasets, compute_mean_std=False, debug=debug)
+
+        self.actor_dataset = chunked_actor_dataset
+        self.actor_episode_starts = actor_episode_starts
+        self.actor_episode_ends = actor_episode_ends
+    
     def offline_fit(self, n_epochs, fit_critic=True, fit_actor=True):
-        if self.offline_dataset is None:
-            raise ValueError('No offline dataset loaded!. Call load_dataset() first.')
+        # Determine which dataset to use based on what we're training
+        if fit_actor and self.actor_dataset is not None:
+            # Use actor dataset for actor training
+            dataset = self.actor_dataset
+        elif fit_critic and self.offline_dataset is not None:
+            # Use offline dataset for critic training
+            dataset = self.offline_dataset
+        else:
+            # Fallback to offline_dataset if actor_dataset not available
+            if self.offline_dataset is None:
+                raise ValueError('No offline dataset loaded!. Call load_dataset() first.')
+            dataset = self.offline_dataset
         
         # Initialize lists to accumulate losses for averaging
         acc_actor_loss = []
@@ -445,8 +481,8 @@ class IQL_DP(DeepAC):
         epoch_count = 0
         with tqdm(total=n_epochs) as pbar:
             for state, action, reward, next_state, absorbing in minibatch_generator(
-                self._batch_size(), self.offline_dataset.state, self.offline_dataset.action,
-                self.offline_dataset.reward, self.offline_dataset.next_state, self.offline_dataset.absorbing):
+                self._batch_size(), dataset.state, dataset.action,
+                dataset.reward, dataset.next_state, dataset.absorbing):
 
                 # if self._normalize_states: # Assumed done at load time
                 #     state_fit = self._norm_states(state)
@@ -708,7 +744,7 @@ class IQL_DP(DeepAC):
     
     def compute_critic_errors(self, optimal_data_percent=0.1):
         """
-        Compute critic errors on the optimal dataset.
+        Compute critic errors on the optimal, offline, and actor datasets.
         Args:
             optimal_data_percent: percentage of the optimal dataset to sample
         
@@ -783,6 +819,8 @@ class IQL_DP(DeepAC):
         optimal_critic_values = []
         offline_critic_errors = []
         offline_critic_values = []
+        actor_critic_errors = []
+        actor_critic_values = []
         
         gamma_horizon = self.mdp_info.gamma ** self.policy._horizon
         shift = self.policy._horizon - self.policy._n_obs_steps
@@ -862,11 +900,76 @@ class IQL_DP(DeepAC):
             offline_critic_errors.extend(errors.cpu().numpy().tolist())
             offline_critic_values.extend(critic_q_values.cpu().numpy().tolist())
         
+        # Process actor dataset if available
+        if self.actor_dataset is not None:
+            # Use saved episode boundaries for actor dataset
+            actor_episode_starts = self.actor_episode_starts
+            actor_episode_ends = self.actor_episode_ends
+            
+            # Filter episodes to only include those ending with absorbing=True (vectorized)
+            actor_end_indices = np.array(actor_episode_ends)
+            # Get absorbing flags at the end of each episode (end_idx - 1)
+            valid_mask = actor_end_indices > 0  # Ensure valid indices
+            if valid_mask.any():
+                last_absorbing_indices = actor_end_indices[valid_mask] - 1
+                absorbing_flags = self.actor_dataset.absorbing[last_absorbing_indices]
+                # Convert to numpy if tensor, and handle shape
+                if isinstance(absorbing_flags, torch.Tensor):
+                    absorbing_flags = absorbing_flags.squeeze().cpu().numpy()
+                else:
+                    absorbing_flags = np.array(absorbing_flags).squeeze()
+                # Create mask for episodes with absorbing=True at the end
+                absorbing_mask = np.zeros(len(actor_episode_ends), dtype=bool)
+                absorbing_mask[valid_mask] = absorbing_flags > 0.5
+                actor_valid_episode_indices = np.where(absorbing_mask)[0]
+            else:
+                actor_valid_episode_indices = np.array([], dtype=int)
+            
+            if len(actor_valid_episode_indices) > 0:
+                n_samples_actor = min(len(sampled_optimal_episode_indices), len(actor_valid_episode_indices))
+                sampled_actor_episode_indices = np.random.choice(actor_valid_episode_indices, size=n_samples_actor, replace=False)
+                
+                # Loop over sampled actor episodes
+                for ep_idx in sampled_actor_episode_indices:
+                    start_idx = actor_episode_starts[ep_idx]
+                    end_idx = actor_episode_ends[ep_idx]
+                    episode_length = end_idx - start_idx
+                    
+                    # Extract episode data
+                    episode_states = self.actor_dataset.state[start_idx:end_idx]
+                    episode_actions = self.actor_dataset.action[start_idx:end_idx]
+                    episode_rewards = self.actor_dataset.reward[start_idx:end_idx]
+                    episode_absorbing = self.actor_dataset.absorbing[start_idx:end_idx]
+                    
+                    # Compute true Q values for each state-action pair
+                    rewards_tensor = episode_rewards.squeeze() if episode_rewards.dim() > 1 else episode_rewards
+                    
+                    # Extract and process absorbing flags
+                    absorbing_tensor = episode_absorbing.squeeze() if episode_absorbing.dim() > 1 else episode_absorbing
+                    
+                    # Compute true Q values using helper function
+                    true_q_values = self._compute_q_values_from_rewards(rewards_tensor, absorbing_tensor, gamma_horizon, shift)
+                    
+                    # Compute network's Q values using critic
+                    with torch.no_grad():
+                        # Use target critic to predict Q values for state-action pairs
+                        critic_q_values = self._target_critic_approximator.predict(episode_states, episode_actions,
+                                                                                     prediction='min', **self._critic_predict_params)
+                    
+                    # Compute errors
+                    if critic_q_values.device != true_q_values.device:
+                        critic_q_values = critic_q_values.to(true_q_values.device)
+                    errors = critic_q_values - true_q_values
+                    actor_critic_errors.extend(errors.cpu().numpy().tolist())
+                    actor_critic_values.extend(critic_q_values.cpu().numpy().tolist())
+        
         # Convert to numpy arrays for easier computation
         optimal_critic_errors = np.array(optimal_critic_errors)
         optimal_critic_values = np.array(optimal_critic_values)
         offline_critic_errors = np.array(offline_critic_errors)
         offline_critic_values = np.array(offline_critic_values)
+        actor_critic_errors = np.array(actor_critic_errors) if len(actor_critic_errors) > 0 else np.array([])
+        actor_critic_values = np.array(actor_critic_values) if len(actor_critic_values) > 0 else np.array([])
         
         # Compute all averages
         critic_errors_dict = {
@@ -876,6 +979,13 @@ class IQL_DP(DeepAC):
             'offline_critic_error_std': np.std(offline_critic_errors) if len(offline_critic_errors) > 0 else 0.0,
             'critic_value_diff_mean': np.mean(optimal_critic_values) - np.mean(offline_critic_values) if len(optimal_critic_values) > 0 and len(offline_critic_values) > 0 else 0.0,
         }
+        
+        # Add actor dataset metrics if available
+        if len(actor_critic_errors) > 0:
+            critic_errors_dict['actor_critic_error_mean'] = np.mean(actor_critic_errors)
+            critic_errors_dict['actor_critic_error_std'] = np.std(actor_critic_errors)
+            if len(actor_critic_values) > 0:
+                critic_errors_dict['actor_critic_value_mean'] = np.mean(actor_critic_values)
         
         return critic_errors_dict
         
