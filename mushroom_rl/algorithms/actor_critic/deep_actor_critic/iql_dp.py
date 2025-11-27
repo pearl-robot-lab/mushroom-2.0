@@ -83,12 +83,67 @@ class IQL_DP(DeepAC):
         target_critic_params = deepcopy(critic_params)
         self._critic_approximator = Regressor(TorchApproximator, **critic_params)
         self._target_critic_approximator = Regressor(TorchApproximator, **target_critic_params)
+        
+        # Check if critic uses transformer and reconfigure optimizer accordingly
+        # Check the first model to see if it's a transformer (all models in ensemble should be same type)
+        if len(self._critic_approximator) > 0 and hasattr(self._critic_approximator[0].network, 'configure_optimizers'):
+            # Use transformer optimizer configuration (similar to actor)
+            # Get transformer parameters from policy_params if available, otherwise use defaults
+            if isinstance(policy_params, dict):
+                transformer_lr = policy_params.get('transformer_lr_critic_net', policy_params.get('transformer_lr_actor_net', 1e-4))
+                transformer_weight_decay = policy_params.get('transformer_weight_decay_critic_net', policy_params.get('transformer_weight_decay_actor_net', 1e-3))
+                transformer_betas = policy_params.get('transformer_betas_critic_net', policy_params.get('transformer_betas_actor_net', (0.9, 0.95)))
+            else:
+                transformer_lr = getattr(policy_params, 'transformer_lr_critic_net', getattr(policy_params, 'transformer_lr_actor_net', 1e-4))
+                transformer_weight_decay = getattr(policy_params, 'transformer_weight_decay_critic_net', getattr(policy_params, 'transformer_weight_decay_actor_net', 1e-3))
+                transformer_betas = getattr(policy_params, 'transformer_betas_critic_net', getattr(policy_params, 'transformer_betas_actor_net', (0.9, 0.95)))
+            
+            # Replace the optimizer in each critic model
+            for i in range(len(self._critic_approximator)):
+                self._critic_approximator[i]._optimizer = self._critic_approximator[i].network.configure_optimizers(
+                    learning_rate=transformer_lr,
+                    weight_decay=transformer_weight_decay,
+                    betas=transformer_betas
+                )
+                # Remove optimizer from save attributes (too large, will be recreated on load)
+                if '_optimizer' in self._critic_approximator[i]._save_attributes:
+                    del self._critic_approximator[i]._save_attributes['_optimizer']
+            
+            # Also remove optimizers from target critic approximators (they don't need optimizers, but remove from save)
+            for i in range(len(self._target_critic_approximator)):
+                if '_optimizer' in self._target_critic_approximator[i]._save_attributes:
+                    del self._target_critic_approximator[i]._save_attributes['_optimizer']
 
         # Add IQL value function approximator & optimizer
         # assert value_func_params['n_models'] == 1 # Single model
         self._value_func_approximator = Regressor(TorchApproximator, **value_func_params)
-        value_func_network_params = self._value_func_approximator.model.network.parameters()
-        self._value_func_optimizer = value_func_optimizer['class'](value_func_network_params, **value_func_optimizer['params'])
+        
+        # Check if value function uses transformer and configure optimizer accordingly
+        # Access the model through the regressor (handles both single model and ensemble)
+        value_func_model = self._value_func_approximator[0] if len(self._value_func_approximator) > 0 else self._value_func_approximator.model
+        if hasattr(value_func_model.network, 'configure_optimizers'):
+            # Use transformer optimizer configuration (similar to actor)
+            # Get transformer parameters from policy_params if available, otherwise use defaults
+            if isinstance(policy_params, dict):
+                transformer_lr = policy_params.get('transformer_lr_critic_net', policy_params.get('transformer_lr_actor_net', 1e-4))
+                transformer_weight_decay = policy_params.get('transformer_weight_decay_critic_net', policy_params.get('transformer_weight_decay_actor_net', 1e-3))
+                transformer_betas = policy_params.get('transformer_betas_critic_net', policy_params.get('transformer_betas_actor_net', (0.9, 0.95)))
+            else:
+                transformer_lr = getattr(policy_params, 'transformer_lr_critic_net', getattr(policy_params, 'transformer_lr_actor_net', 1e-4))
+                transformer_weight_decay = getattr(policy_params, 'transformer_weight_decay_critic_net', getattr(policy_params, 'transformer_weight_decay_actor_net', 1e-3))
+                transformer_betas = getattr(policy_params, 'transformer_betas_critic_net', getattr(policy_params, 'transformer_betas_actor_net', (0.9, 0.95)))
+            
+            self._value_func_optimizer = value_func_model.network.configure_optimizers(
+                learning_rate=transformer_lr,
+                weight_decay=transformer_weight_decay,
+                betas=transformer_betas
+            )
+        else:
+            # Use standard optimizer
+            if value_func_optimizer is None:
+                raise ValueError("value_func_optimizer cannot be None when network does not have configure_optimizers method")
+            value_func_network_params = value_func_model.network.parameters()
+            self._value_func_optimizer = value_func_optimizer['class'](value_func_network_params, **value_func_optimizer['params'])
 
         # self._actor_approximator = Regressor(TorchApproximator, **actor_params)
 
@@ -165,7 +220,7 @@ class IQL_DP(DeepAC):
             _critic_approximator='mushroom',
             _target_critic_approximator='mushroom',
             _value_func_approximator='mushroom',
-            _value_func_optimizer='torch',
+            # _value_func_optimizer='torch',
             # _actor_approximator='mushroom',
             _squash_actions='primitive',
             _discrete_action_dims='primitive',
