@@ -709,15 +709,17 @@ class IQL_DP(DeepAC):
         bc_loss = policy_forward_output['loss']
         bc_loss = bc_loss.mean((1,2)) # mean over action dim and horizon dim to get (batch,)
 
-        actor_loss = bc_loss.mean()
-        q_loss = torch.tensor(0.0).to(TorchUtils.get_device())
-        # # DDPG loss - need to flatten the predicted action for the critic
-        # act_pred_flat = self._flatten_action_for_critic(act_pred).cpu()
-        # q = self._critic_approximator(state_tensor, act_pred_flat, **self._critic_predict_params)
-        # q_loss = -q
+        # DEBUG:
+        # actor_loss = bc_loss.mean()
+        # q_loss = torch.tensor(0.0).to(TorchUtils.get_device())
+        # END DEBUG
+        # DDPG loss - need to flatten the predicted action for the critic
+        act_pred_flat = self._flatten_action_for_critic(act_pred).cpu()
+        q = self._critic_approximator(state_tensor, act_pred_flat, **self._critic_predict_params)
+        q_loss = -q
 
         # Total loss
-        # actor_loss = torch.mean(q_loss + self._bc_weight_in_ddpg() * bc_loss)
+        actor_loss = torch.mean(q_loss + self._bc_weight_in_ddpg() * bc_loss)
 
         self._optimize_actor_parameters(actor_loss)
         
