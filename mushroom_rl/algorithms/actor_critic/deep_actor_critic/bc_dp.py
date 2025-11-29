@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import sys
 
 from mushroom_rl.algorithms.actor_critic.deep_actor_critic import DeepAC
 from mushroom_rl.policy import Policy
@@ -9,6 +10,11 @@ from mushroom_rl.utils.minibatches import minibatch_generator
 from mushroom_rl.rl_utils.parameters import Parameter, to_parameter
 from mushroom_rl.utils.torch import TorchUtils
 from tqdm import tqdm, trange
+
+# Helper function to check if output is redirected (for disabling tqdm in log files)
+def should_disable_tqdm():
+    """Returns True if stderr is not a TTY (i.e., output is redirected to a file)"""
+    return not sys.stderr.isatty()
 
 # from torch.nn.functional import binary_cross_entropy_with_logits
 
@@ -239,9 +245,9 @@ class BC_DP(DeepAC):
         
         acc_loss = []
         # fit on the dataset (for n_epochs)
-        for epoch in trange(n_epochs):
+        for epoch in trange(n_epochs, disable=should_disable_tqdm()):
             minibatches = len(demo_dataset['obs']) // self._batch_size()
-            with tqdm(total=minibatches) as pbar:
+            with tqdm(total=minibatches, disable=should_disable_tqdm()) as pbar:
                 for obs, act in minibatch_generator(self._batch_size(), demo_dataset['obs'], demo_dataset['action']):
                     # if self._normalize_states:
                     #     state_fit = self._norm_states(obs)

@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import sys
 from mushroom_rl.algorithms.actor_critic.deep_actor_critic import DeepAC
 from mushroom_rl.policy import Policy
 from mushroom_rl.approximators import Regressor
@@ -13,6 +14,11 @@ from mushroom_rl.rl_utils.parameters import Parameter, to_parameter
 from mushroom_rl.utils.torch import TorchUtils
 from tqdm import tqdm, trange
 from copy import deepcopy
+
+# Helper function to check if output is redirected (for disabling tqdm in log files)
+def should_disable_tqdm():
+    """Returns True if stderr is not a TTY (i.e., output is redirected to a file)"""
+    return not sys.stderr.isatty()
 
 # from torch.nn.functional import binary_cross_entropy_with_logits
 
@@ -534,7 +540,7 @@ class IQL_DP(DeepAC):
         # for epoch in trange(n_epochs):
         #     state, action, reward, next_state, absorbing, _ = self._replay_memory.get(self._batch_size())
         epoch_count = 0
-        with tqdm(total=n_epochs) as pbar:
+        with tqdm(total=n_epochs, disable=should_disable_tqdm()) as pbar:
             for state, action, reward, next_state, absorbing in minibatch_generator(
                 self._batch_size(), dataset.state, dataset.action,
                 dataset.reward, dataset.next_state, dataset.absorbing):
