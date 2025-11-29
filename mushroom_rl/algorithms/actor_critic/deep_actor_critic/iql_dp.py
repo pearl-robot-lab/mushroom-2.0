@@ -683,7 +683,7 @@ class IQL_DP(DeepAC):
 
     def _update_actor_awr(self, adv, state, action):
         # compute advantage weighted BC loss
-        exp_adv = torch.exp(self._iql_beta() * adv.detach()).clamp(max=self._max_clamp_adv)
+        exp_adv = torch.exp(self._iql_beta() * adv.detach()).clamp(max=self._max_clamp_adv())
 
         # target action from data:
         act = torch.as_tensor(action, dtype=torch.float32, device=TorchUtils.get_device())
