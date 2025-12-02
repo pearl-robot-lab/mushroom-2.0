@@ -987,6 +987,42 @@ class IQL_DP(DeepAC):
         
         return critic_errors_dict
         
+    def create_new_model(self, model_config):
+        """
+        Create a new model and assign it to the policy
+        """
+        # Create new model
+        self.policy._model = model_config['model_class'](model_config)
+        # Move model to correct device
+        self.policy._model.to(TorchUtils.get_device())
+    
     def _post_load(self):
-        self._actor_approximator = self.policy._approximator
-        self._update_optimizer_parameters(self._actor_approximator.model.network.parameters())
+        # reset tracking variables
+        self._actor_last_loss = None
+        self._actor_last_bc_loss = None
+        self._actor_last_q_loss = None
+        self._q_last_loss = None
+        self._value_last_loss = None
+        self._last_exp_adv = None
+
+        if not hasattr(self, 'offline_dataset'):
+            self.offline_dataset = None
+        if not hasattr(self, 'optimal_dataset'):
+            self.optimal_dataset = None
+        if not hasattr(self, 'actor_dataset'):
+            self.actor_dataset = None
+        if not hasattr(self, 'offline_episode_starts'):
+            self.offline_episode_starts = None
+        if not hasattr(self, 'offline_episode_ends'):
+            self.offline_episode_ends = None
+        if not hasattr(self, 'optimal_episode_starts'):
+            self.optimal_episode_starts = None
+        if not hasattr(self, 'optimal_episode_ends'):
+            self.optimal_episode_ends = None
+        if not hasattr(self, 'actor_episode_starts'):
+            self.actor_episode_starts = None
+        if not hasattr(self, 'actor_episode_ends'):
+            self.actor_episode_ends = None
+
+        # self._actor_approximator = self.policy._approximator
+        # self._update_optimizer_parameters(self._actor_approximator.model.network.parameters())

@@ -56,6 +56,8 @@ class TorchApproximator(Serializable):
 
         if optimizer is not None:
             self._optimizer = optimizer['class'](self.network.parameters(), **optimizer['params'])
+        else:
+            self._optimizer = None
         self._loss = loss
 
         self._add_save_attr(
@@ -311,7 +313,7 @@ class TorchApproximator(Serializable):
         return self._last_loss
 
     def _post_load(self):
-        if self._optimizer is not None:
+        if hasattr(self, '_optimizer') and self._optimizer is not None:
             TorchUtils.update_optimizer_parameters(self._optimizer, list(self.network.parameters()))
 
 
