@@ -875,8 +875,7 @@ class IQL_DP(DeepAC):
             
             # Compute network's Q values using critic
             with torch.no_grad():
-                critic_q_values = self._target_critic_approximator.predict(
-                    episode_states, episode_actions, prediction='min', **self._critic_predict_params)
+                critic_q_values = self._critic_approximator(episode_states, episode_actions, **self._critic_predict_params)
             
             # Compute errors
             if critic_q_values.device != true_q_values.device:
