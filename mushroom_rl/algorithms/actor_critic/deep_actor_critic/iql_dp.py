@@ -242,6 +242,27 @@ class IQL_DP(DeepAC):
             _iql_tau='mushroom',
             _max_clamp_adv='mushroom',
         )
+
+    def update_actor_training_hyperparams(self, actor_loss_type=None, bc_weight_in_ddpg=None, iql_beta=None, iql_tau=None, max_clamp_adv=None):
+        """
+        Update the actor training hyperparameters. Useful when loading critic from checkpoint and then training actor with different hyperparameters.
+        Args:
+            actor_loss_type: str, type of actor loss to use. Options: 'awr', 'ddpg_plus_bc'
+            bc_weight_in_ddpg: float, weight for the BC loss in DDPG_BC
+            iql_beta: float, inverse temperature for AWR
+            iql_tau: float, coefficient for the asymmetric IQL loss
+            max_clamp_adv: float, maximum value considered for the advantage
+        """
+        if actor_loss_type is not None:
+            self._actor_loss_type = actor_loss_type
+        if bc_weight_in_ddpg is not None:
+            self._bc_weight_in_ddpg = to_parameter(bc_weight_in_ddpg)
+        if iql_beta is not None:
+            self._iql_beta = to_parameter(iql_beta)
+        if iql_tau is not None:
+            self._iql_tau = to_parameter(iql_tau)
+        if max_clamp_adv is not None:
+            self._max_clamp_adv = to_parameter(max_clamp_adv)
     
     def _get_episode_boundaries(self, dataset):
         """
