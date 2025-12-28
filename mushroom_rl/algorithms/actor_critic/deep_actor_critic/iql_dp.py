@@ -691,6 +691,7 @@ class IQL_DP(DeepAC):
         # Query DP for BC loss
         batch = self._create_batch_for_dp(state, act)
         bc_loss = self.policy.forward(batch, self._squash_actions)['loss']
+        bc_loss = bc_loss.mean((1,2)) # mean over action dim and horizon dim to get (batch,)
 
         # Compute actor loss
         actor_loss = torch.mean(exp_adv * bc_loss)
