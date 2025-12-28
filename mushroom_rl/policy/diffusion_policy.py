@@ -299,7 +299,7 @@ class DiffusionPolicy(ParametricPolicy):
         if self._low.device != state.device:
             self._low = self._low.to(state.device)
             self._high = self._high.to(state.device)
-            self._chol_sigma = self._chol_sigma.to(state.device)
+            # self._chol_sigma = self._chol_sigma.to(state.device)
         with torch.no_grad():
             ## Debug for distribution shift...
             if self.debug_replay_states is not None:

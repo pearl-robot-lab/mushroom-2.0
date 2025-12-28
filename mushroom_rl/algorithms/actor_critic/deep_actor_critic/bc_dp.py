@@ -156,12 +156,30 @@ class BC_DP(DeepAC):
         
         return episode_starts, episode_ends
     
-    def load_dataset(self, dataset, debug=False):
-        # Copy over dataset. Convert to torch tensors
-        self.dataset = dict()
-        self.dataset['obs'] = torch.as_tensor(dataset['obs'], dtype=torch.float32)
-        self.dataset['action'] = torch.as_tensor(dataset['action'], dtype=torch.float32)
-        self.dataset['last'] = torch.as_tensor(dataset['last'], dtype=torch.bool)
+    def load_dataset(self, datasets, debug=False):
+        """
+        Load and process datasets for behavior cloning.
+        
+        Args:
+            datasets: list of dictionaries with keys: obs, action, last
+            debug: if True, limit processing for debugging
+        """
+
+        obs_list = []
+        action_list = []
+        last_list = []
+        for dataset in datasets:
+            # Convert to torch tensors and accumulate in lists
+            obs_list.append(torch.as_tensor(dataset['obs'], dtype=torch.float32))
+            action_list.append(torch.as_tensor(dataset['action'], dtype=torch.float32))
+            last_list.append(torch.as_tensor(dataset['last'], dtype=torch.bool))
+        
+        # Concatenate
+        self.dataset = {
+            'obs': torch.cat(obs_list, dim=0),
+            'action': torch.cat(action_list, dim=0),
+            'last': torch.cat(last_list, dim=0)
+        }
         
         # normalize if needed
         if self._normalize_states:

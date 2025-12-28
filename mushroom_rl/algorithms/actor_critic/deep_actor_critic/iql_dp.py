@@ -743,6 +743,11 @@ class IQL_DP(DeepAC):
         obs_dim = self.mdp_info.observation_space.shape[0]  # Original observation dimension
         act_dim = self.mdp_info.action_space.shape[0]  # Original action dimension
         
+        # Ensure tensors are on the correct device
+        device = TorchUtils.get_device()
+        state = torch.as_tensor(state, dtype=torch.float32, device=device)
+        action = torch.as_tensor(action, dtype=torch.float32, device=device)
+        
         state_reshaped = state.view(-1, n_obs_steps, obs_dim)
         action_reshaped = action.view(-1, action_horizon, act_dim)
         
