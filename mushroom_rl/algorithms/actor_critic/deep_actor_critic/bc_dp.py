@@ -31,7 +31,8 @@ class BC_DP(DeepAC):
                  batch_size=1, n_epochs_policy=1, patience=1, squash_actions=False,
                  discrete_action_dims=0, continuous_action_dims=0,
                  normalize_states=False, normalize_actions=False,
-                 critic_fit_params=None, actor_predict_params=None, critic_predict_params=None):
+                 critic_fit_params=None, actor_predict_params=None, critic_predict_params=None,
+                 spectral_norm_lambda=0.0):
         """
         Constructor.
 
@@ -55,6 +56,11 @@ class BC_DP(DeepAC):
             critic_fit_params (dict, None): Unused parameter; Left for future
             actor_predict_params (dict, None): Unused parameter; Left for future
             critic_predict_params (dict, None): Unused parameter; Left for future
+            spectral_norm_lambda (float, 0.0): (Optional) coefficient for spectral norm 
+                regularization penalty. When > 0, adds λ * sum(||σ_max(W)||²) over all 
+                weight matrices W in the policy network. This enforces Lipschitz continuity
+                on the policy. Reference: "Spectral norm regularization for improving the 
+                generalizability of deep learning" (Yoshida & Miyato, 2017).
 
         """
 
@@ -83,6 +89,7 @@ class BC_DP(DeepAC):
         self._discrete_action_dims = discrete_action_dims # unused for now
         self._continuous_action_dims = continuous_action_dims # unused for now
 
+        self._spectral_norm_lambda = to_parameter(spectral_norm_lambda)
         self._fit_count = 0
         self._actor_last_loss = None # Store actor loss for logging
 
@@ -112,6 +119,7 @@ class BC_DP(DeepAC):
             # _actor_predict_params='pickle',
             # _actor_approximator='mushroom',
             _fit_count='primitive',
+            _spectral_norm_lambda='mushroom',
         )
     
     def _get_episode_boundaries(self, last_array):
@@ -155,6 +163,66 @@ class BC_DP(DeepAC):
             episode_ends = [dataset_length]
         
         return episode_starts, episode_ends
+    
+    def _compute_spectral_norm_penalty(self, n_power_iterations=1):
+        """
+        Compute the spectral norm regularization penalty.
+        
+        Returns the sum of squared spectral norms (largest singular values) 
+        over all weight matrices in the policy network.
+        
+        Uses power iteration for efficiency (much faster than full SVD):
+        - Reshapes weight tensors to 2D matrices (height, -1) where height is the first dimension
+        - Approximates spectral norm using power iteration (matches spectral_norm.py approach)
+        - Sums the squared spectral norms as per the regularization penalty
+        
+        For transformer models, this includes:
+        - Attention weight matrices (Q, K, V projections, output projection)
+        - Feed-forward network weight matrices (2 linear layers per block)
+        - Embedding matrices (input/positional embeddings if learnable)
+        - All other weight matrices in the network
+        
+        Args:
+            n_power_iterations (int): Number of power iteration steps (default: 1).
+                More iterations = more accurate but slower. 1 iteration is usually sufficient.
+        
+        Returns:
+            torch.Tensor: Sum of ||σ_max(W)||² for all weight matrices W
+        """
+        from torch.nn.functional import normalize
+        
+        penalty = torch.tensor(0.0, device=TorchUtils.get_device())
+        eps = 1e-12
+        
+        for param in self.policy._model.parameters():
+            # Only consider weight matrices (2D tensors or higher)
+            # Skip bias terms and 1D parameters (e.g., layer norm scale/bias)
+            # For transformers: this includes attention weights, FFN weights, embeddings
+            if param.dim() >= 2:
+                # Reshape weight to 2D matrix following spectral_norm.py approach:
+                # height = first dimension, width = all other dimensions flattened
+                height = param.size(0)
+                weight_mat = param.reshape(height, -1)
+                
+                # Use power iteration for efficient spectral norm approximation
+                # This is much faster than full SVD, especially for large matrices
+                # Initialize u and v randomly (using current weight values for stability)
+                h, w = weight_mat.size()
+                u = normalize(weight_mat.new_empty(h).normal_(0, 1), dim=0, eps=eps)
+                v = normalize(weight_mat.new_empty(w).normal_(0, 1), dim=0, eps=eps)
+                
+                # Power iteration: u^T W v approximates the largest singular value
+                for _ in range(n_power_iterations):
+                    v = normalize(torch.mv(weight_mat.t(), u), dim=0, eps=eps)
+                    u = normalize(torch.mv(weight_mat, v), dim=0, eps=eps)
+                
+                # Compute spectral norm: σ_max ≈ u^T W v
+                spectral_norm = torch.abs(torch.dot(u, torch.mv(weight_mat, v)))
+                
+                # Add squared spectral norm to penalty
+                penalty = penalty + spectral_norm ** 2
+        
+        return penalty
     
     def load_dataset(self, datasets, debug=False):
         """
@@ -280,6 +348,13 @@ class BC_DP(DeepAC):
                     
                     batch = {'observation.state': obs, 'action': act}
                     loss = self.policy.forward(batch, self._squash_actions)['loss'].mean()
+                    
+                    # Add spectral norm regularization penalty if enabled
+                    spectral_norm_lambda = self._spectral_norm_lambda()
+                    if spectral_norm_lambda > 0.0:
+                        spectral_norm_penalty = self._compute_spectral_norm_penalty()
+                        loss = loss + spectral_norm_lambda * spectral_norm_penalty
+                    
                     self._optimize_actor_parameters(loss)
 
                     self._fit_count += 1
