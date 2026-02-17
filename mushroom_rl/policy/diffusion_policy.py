@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from pathlib import Path
+from typing import Optional, Sequence
 from .policy import ParametricPolicy
 from collections import deque
 import torch.nn.functional as F  # noqa: N812
@@ -150,6 +151,71 @@ class DiffusionPolicy(ParametricPolicy):
             # clear full_episode_actions dict for the next episode
             self._full_episode_actions = {}
             self._episode_step = 0
+
+    def _postprocess_action_chunk(self, actions_chunk: Tensor) -> Tensor:
+        """Apply policy post-processing (squash, unnormalize, clip) to a chunk."""
+        if self._squash_actions:
+            actions_chunk = torch.tanh(actions_chunk)
+
+        if self._normalize_actions:
+            if self._actions_mean is None or self._actions_std is None:
+                raise ValueError("Action normalization is enabled but mean/std are not set")
+            actions_mean = self._actions_mean.to(actions_chunk.device)
+            actions_std = self._actions_std.to(actions_chunk.device)
+            actions_chunk = actions_chunk * actions_std + actions_mean
+
+        if actions_chunk.dim() == 3:
+            low = self._low.to(actions_chunk.device).view(1, 1, -1)
+            high = self._high.to(actions_chunk.device).view(1, 1, -1)
+        elif actions_chunk.dim() == 2:
+            low = self._low.to(actions_chunk.device).view(1, -1)
+            high = self._high.to(actions_chunk.device).view(1, -1)
+        else:
+            raise ValueError(f"Unsupported action chunk rank: {actions_chunk.dim()}")
+
+        return torch.clip(actions_chunk, low, high)
+
+    @torch.no_grad()
+    def generate_action_chunk_from_obs_history(
+        self,
+        obs_history: Sequence[Tensor],
+        n_action_steps: Optional[int] = None,
+    ) -> Tensor:
+        """
+        Generate a post-processed action chunk from an observation history snapshot.
+
+        This bypasses the internal rollout queues and is useful for external schedulers
+        (e.g. async/double-buffer execution) that manage their own buffering.
+        """
+        if len(obs_history) < self._n_obs_steps:
+            raise ValueError(
+                f"Need at least {self._n_obs_steps} observations, got {len(obs_history)}"
+            )
+
+        # Keep the most recent n_obs_steps observations.
+        obs_window = list(obs_history)[-self._n_obs_steps:]
+        obs_stack = torch.stack(obs_window, dim=0).unsqueeze(0).to(TorchUtils.get_device())
+
+        if self._normalize_states:
+            if self._states_mean is None or self._states_std is None:
+                raise ValueError("State normalization is enabled but mean/std are not set")
+            states_mean = self._states_mean.to(obs_stack.device)
+            states_std = self._states_std.to(obs_stack.device)
+            obs_stack = (obs_stack - states_mean) / states_std
+
+        batch = {"observation.state": obs_stack}
+        actions = self._model.generate_actions(batch)
+        num_steps = self._n_action_steps if n_action_steps is None else n_action_steps
+        start = self._n_obs_steps - 1
+        end = start + num_steps
+        if end > actions.shape[1]:
+            raise ValueError(
+                f"Requested actions [{start}:{end}] exceed model horizon {actions.shape[1]}"
+            )
+        actions_chunk = actions[:, start:end].clone()
+        actions_chunk = self._postprocess_action_chunk(actions_chunk)
+
+        return actions_chunk[0]
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
