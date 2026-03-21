@@ -99,6 +99,11 @@ class DiffusionPolicy(ParametricPolicy):
         self._actions_mean = None # will be set by the agent class
         self._actions_std = None # will be set by the agent class
 
+        # Optional EMA filtering for evaluation-time actions.
+        self._eval_ema_enabled = policy_params.get('eval_ema_enabled', True)
+        self._eval_ema_alpha = policy_params.get('eval_ema_alpha', 0.1)
+        self._prev_smoothed_action = None
+
         # debug
         self.debug_replay_states = None
         self.debug_replay_actions = None
@@ -124,6 +129,9 @@ class DiffusionPolicy(ParametricPolicy):
             _normalize_actions='primitive',
             _actions_mean='primitive',
             _actions_std='primitive',
+            _eval_ema_enabled='primitive',
+            _eval_ema_alpha='primitive',
+            _prev_smoothed_action='torch',
             debug_replay_states='primitive',
             debug_replay_actions='primitive',
             debug_replay_index='primitive',
@@ -137,10 +145,12 @@ class DiffusionPolicy(ParametricPolicy):
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
+        self._ensure_eval_ema_attrs()
         self._queues = {
             "observation.state": deque(maxlen=self._n_obs_steps),
             "action": deque(maxlen=self._n_action_steps),
         }
+        self._prev_smoothed_action = None
         if self._image_features:
             raise NotImplementedError("Image features are not implemented yet")
             self._queues["observation.images"] = deque(maxlen=self._n_obs_steps)
@@ -151,6 +161,29 @@ class DiffusionPolicy(ParametricPolicy):
             # clear full_episode_actions dict for the next episode
             self._full_episode_actions = {}
             self._episode_step = 0
+
+    def _ensure_eval_ema_attrs(self):
+        """Backwards-compatible defaults for checkpoints saved before EMA fields existed."""
+        if not hasattr(self, "_eval_ema_enabled"):
+            self._eval_ema_enabled = True
+        if not hasattr(self, "_eval_ema_alpha"):
+            self._eval_ema_alpha = 0.1
+        if not hasattr(self, "_prev_smoothed_action"):
+            self._prev_smoothed_action = None
+
+    def _apply_eval_ema(self, action: Tensor) -> Tensor:
+        self._ensure_eval_ema_attrs()
+        if (not self._eval_ema_enabled) or (not self._draw_deterministic):
+            return action
+
+        alpha = float(self._eval_ema_alpha)
+        if self._prev_smoothed_action is None or self._prev_smoothed_action.shape != action.shape:
+            self._prev_smoothed_action = action.clone()
+        else:
+            prev = self._prev_smoothed_action.to(action.device, dtype=action.dtype)
+            self._prev_smoothed_action = alpha * action + (1.0 - alpha) * prev
+
+        return self._prev_smoothed_action.clone()
 
     def _postprocess_action_chunk(self, actions_chunk: Tensor) -> Tensor:
         """Apply policy post-processing (squash, unnormalize, clip) to a chunk."""
@@ -433,6 +466,7 @@ class DiffusionPolicy(ParametricPolicy):
                 action = next_replay_action
             ## Debug end
 
+            action = self._apply_eval_ema(action)
             action_clipped = torch.clip(action, self._low, self._high)
             
             return action_clipped, None
