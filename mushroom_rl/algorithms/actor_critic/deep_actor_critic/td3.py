@@ -111,3 +111,9 @@ class TD3(DDPG):
         # Older TD3 checkpoints may not contain newer logging attributes.
         if not hasattr(self, '_actor_last_loss'):
             self._actor_last_loss = None
+        if not hasattr(self, '_squash_actions'):
+            self._squash_actions = False
+        if not hasattr(self, '_noise_std'):
+            self._noise_std = to_parameter(.2)
+        if not hasattr(self, '_noise_clip'):
+            self._noise_clip = to_parameter(.5)

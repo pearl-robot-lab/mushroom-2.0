@@ -86,6 +86,7 @@ class DDPG(DeepAC):
             _tau='mushroom',
             _policy_delay='mushroom',
             _fit_count='primitive',
+            _actor_last_loss='pickle',
             _replay_memory='mushroom',
             _critic_approximator='mushroom',
             _target_critic_approximator='mushroom',
@@ -143,3 +144,6 @@ class DDPG(DeepAC):
     def _post_load(self):
         self._actor_approximator = self.policy._approximator
         self._update_optimizer_parameters(self._actor_approximator.model.network.parameters())
+
+        if not hasattr(self, '_actor_last_loss'):
+            self._actor_last_loss = None
