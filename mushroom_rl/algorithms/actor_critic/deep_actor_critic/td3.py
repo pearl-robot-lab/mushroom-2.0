@@ -49,6 +49,7 @@ class TD3(DDPG):
         self._noise_std = to_parameter(noise_std)
         self._noise_clip = to_parameter(noise_clip)
         self._squash_actions = squash_actions
+        self._actor_last_loss = None
 
         if 'n_models' in critic_params.keys():
             assert(critic_params['n_models'] >= 2)
@@ -61,7 +62,8 @@ class TD3(DDPG):
         self._add_save_attr(
             _noise_std='mushroom',
             _noise_clip='mushroom',
-            _squash_actions='primitive'
+            _squash_actions='primitive',
+            _actor_last_loss='pickle'
         )
 
     def _loss(self, state):
@@ -102,3 +104,10 @@ class TD3(DDPG):
         q *= (~absorbing)
 
         return q
+
+    def _post_load(self):
+        super()._post_load()
+
+        # Older TD3 checkpoints may not contain newer logging attributes.
+        if not hasattr(self, '_actor_last_loss'):
+            self._actor_last_loss = None

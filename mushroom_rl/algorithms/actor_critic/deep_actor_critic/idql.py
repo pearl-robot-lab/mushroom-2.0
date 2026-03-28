@@ -16,7 +16,7 @@ class IDQL(IQL_DP):
     No training is performed - this is purely a test-time method.
     """
     
-    def __init__(self, *args, idql_n_samples=64, **kwargs):
+    def __init__(self, *args, idql_n_samples=128, **kwargs):
         """
         Initialize IDQL with configurable parameters.
         
